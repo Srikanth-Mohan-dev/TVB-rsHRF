@@ -3,3 +3,4 @@ scipy
 matplotlib
 nitime
 awscli
+rsHRF
