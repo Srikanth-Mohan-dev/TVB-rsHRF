@@ -528,6 +528,200 @@ def select_best_G(G_values_sorted, r_values, tol=1e-3):
     best_idx = max(idx_valid, key=lambda i: r_values[i])
     return G_values_sorted[best_idx], r_values[best_idx], best_idx
 
+# BOLD-only convention: simulate 250 TRs, discard the first 50 -> 200
+# TRs of settled BOLD saved to disk. Separate from DISCARD_TRS above
+# (which belongs to get_fc_correlation's unused `discard` param) so
+# changing one can never silently change the other.
+BOLD_ONLY_DISCARD_TRS = 50
+
+def simulate_bold_only(dataset, sub_str, G=0.81):
+    """
+    Fast path: simulate BOLD (Legacy BW + rsHRF) for ONE G value only,
+    and save the raw BOLD timeseries — no FC sweep, no Pearson
+    correlation against empirical FC. Skips the slow part (16 G values
+    x FC computation); useful for quickly inspecting/plotting
+    per-region BOLD traces.
+
+    BOLD convention: simulate 250 TRs, discard the first 50 -> 200 TRs
+    of settled BOLD saved to disk.
+
+    Saves into the same results/<dataset>/<subject>/outputs/G_sweep/
+    folder as run_subject().
+    """
+    print("\n" + "=" * 60)
+    print(f"BOLD-ONLY  DATASET: {dataset}  SUBJECT: {sub_str}  G={G:.2f}")
+    print("=" * 60)
+
+    out_dir = results_dir(dataset, sub_str)
+    os.makedirs(out_dir, exist_ok=True)
+
+    try:
+        d = load_subject_data(dataset, sub_str)
+    except Exception as e:
+        print(f"  FAILED to load data: {e}")
+        return
+
+    weights       = d["weights"]
+    tract_lengths = d["tract_lengths"]
+    hrf_compact   = d["hrf_compact"]
+    N             = d["N"]
+    BOLD_TR_ms    = d["BOLD_TR_ms"]
+    TR            = d["TR"]
+
+    bold_dur_ms = int(BOLD_TR_ms * 250)   # 250 TRs simulated, no debate
+    print(f"  N={N}  TR={TR}s  total_dur={bold_dur_ms}ms  G={G:.2f}")
+
+    print("  Simulating Legacy (BW)...")
+    bold_leg_full = run_simulation(
+        G, weights, tract_lengths, hrf_compact,
+        bold_dur_ms, BOLD_TR_ms, N, mode='legacy')
+    bold_leg = bold_leg_full[:, BOLD_ONLY_DISCARD_TRS:]   # discard first 50
+    del bold_leg_full
+
+    print("  Simulating rsHRF (canon2dd)...")
+    bold_hrf_full = run_simulation(
+        G, weights, tract_lengths, hrf_compact,
+        bold_dur_ms, BOLD_TR_ms, N, mode='rshrf')
+    bold_hrf = bold_hrf_full[:, BOLD_ONLY_DISCARD_TRS:]   # discard first 50
+    del bold_hrf_full
+
+    np.save(os.path.join(out_dir, "bold_legacy_single_G.npy"), bold_leg)
+    np.save(os.path.join(out_dir, "bold_rshrf_single_G.npy"),  bold_hrf)
+    with open(os.path.join(out_dir, "bold_single_G_value.txt"), "w") as f:
+        f.write(f"{G}\n")
+
+    print(f"  Legacy BOLD shape: {bold_leg.shape}  rsHRF BOLD shape: {bold_hrf.shape}")
+    print(f"  Saved to: {out_dir}")
+    return bold_leg, bold_hrf
+
+def summary_dir(dataset):
+    return os.path.normpath(os.path.join(RESULTS_ROOT, dataset, "summary"))
+
+def summarize_subjects(dataset, subjects=None):
+    """
+    Aggregate across subjects using ONLY the per-subject files already
+    on disk from run_subject() — PCorr_legacy.txt, PCorr_rshrf.txt,
+    G_values.txt. No summary.json needed or produced.
+
+    Saves two plots under results/<dataset>/summary/:
+      1. best_fit_paired_scatter.png — best-fit (max of the sweep
+         curve, same selection rule as run_subject's select_best_G)
+         Legacy PCorr vs rsHRF PCorr, one point per subject.
+      2. best_fit_parameter_differences.png — the "model parameters"
+         at best fit, meaning the PCorr Legacy/rsHRF values themselves:
+         a grouped bar chart per subject, plus a difference bar chart
+         (rsHRF − Legacy), colored by CON/PAT.
+
+    subjects: list of subject IDs to include, or None for ALL_SUBJECTS
+    (subjects without completed PCorr files are skipped automatically).
+    """
+    if subjects is None:
+        subjects = ALL_SUBJECTS
+
+    G_TOL = 0.015
+    subs, best_r_leg, best_r_hrf = [], [], []
+
+    for sub in subjects:
+        out_dir  = results_dir(dataset, sub)
+        g_path   = os.path.join(out_dir, "G_values.txt")
+        leg_path = os.path.join(out_dir, "PCorr_legacy.txt")
+        hrf_path = os.path.join(out_dir, "PCorr_rshrf.txt")
+        if not (os.path.exists(g_path) and os.path.exists(leg_path) and os.path.exists(hrf_path)):
+            continue
+
+        G_values     = np.loadtxt(g_path)
+        PCorr_legacy = np.loadtxt(leg_path)
+        PCorr_rshrf  = np.loadtxt(hrf_path)
+
+        asc_order = np.argsort(G_values)
+        G_asc     = list(G_values[asc_order])
+        r_leg_asc = list(PCorr_legacy[asc_order])
+        r_hrf_asc = list(PCorr_rshrf[asc_order])
+
+        _, best_rl, _ = select_best_G(G_asc, r_leg_asc, tol=G_TOL)
+        _, best_rh, _ = select_best_G(G_asc, r_hrf_asc, tol=G_TOL)
+
+        subs.append(sub)
+        best_r_leg.append(best_rl)
+        best_r_hrf.append(best_rh)
+
+    if not subs:
+        print(f"  No subjects with completed PCorr files found for dataset={dataset}")
+        return
+
+    r_leg_arr = np.array(best_r_leg, dtype=float)
+    r_hrf_arr = np.array(best_r_hrf, dtype=float)
+    valid   = ~(np.isnan(r_leg_arr) | np.isnan(r_hrf_arr))
+    subs_v  = [s for s, v in zip(subs, valid) if v]
+    r_leg_v = r_leg_arr[valid]
+    r_hrf_v = r_hrf_arr[valid]
+    is_con  = np.array([s.upper().startswith('CON') for s in subs_v])
+
+    if len(subs_v) == 0:
+        print(f"  All {len(subs)} subject(s) found had NaN best-fit r — nothing to plot")
+        return
+
+    out_dir = summary_dir(dataset)
+    os.makedirs(out_dir, exist_ok=True)
+
+    # ── PLOT 1: paired scatter — rsHRF (canon2dd) vs Legacy (BW),
+    # best-fit (max of sweep curve). TWO SIDE-BY-SIDE PANELS, one per
+    # group (Controls, Patients), each with its own "Equal performance"
+    # diagonal and a vertical connector from each point down to that
+    # diagonal, matching the reference figure exactly. ──
+    n_con = int(np.sum(is_con))
+    n_pat = int(np.sum(~is_con))
+    n_hrf_wins_con = int(np.sum(r_hrf_v[is_con]  > r_leg_v[is_con]))
+    n_hrf_wins_pat = int(np.sum(r_hrf_v[~is_con] > r_leg_v[~is_con]))
+
+    lo = min(r_leg_v.min(), r_hrf_v.min()) - 0.02
+    hi = max(r_leg_v.max(), r_hrf_v.max()) + 0.02
+
+    fig, (axC, axP) = plt.subplots(1, 2, figsize=(14, 7))
+    panels = [
+        (axC, is_con,  'tab:blue',   f"Controls (CON)\nrsHRF better in {n_hrf_wins_con}/{n_con} subjects"),
+        (axP, ~is_con, 'tab:orange', f"Patients (PAT)\nrsHRF better in {n_hrf_wins_pat}/{n_pat} subjects"),
+    ]
+    for axg, mask, color, subtitle in panels:
+        rl, rh = r_leg_v[mask], r_hrf_v[mask]
+        axg.plot([lo, hi], [lo, hi], 'k--', alpha=0.6, label='Equal performance')
+        for rli, rhi in zip(rl, rh):
+            axg.plot([rli, rli], [rli, rhi], color=color, linewidth=1, alpha=0.5, zorder=1)
+        axg.scatter(rl, rh, color=color, s=70, edgecolor='none', zorder=2)
+        axg.set_xlabel("Legacy (BW) — Pearson r")
+        axg.set_ylabel("rsHRF (canon2dd) — Pearson r")
+        axg.set_title(subtitle)
+        axg.set_xlim(lo, hi); axg.set_ylim(lo, hi)
+        axg.legend(); axg.grid(True, alpha=0.3)
+
+    plt.suptitle("Paired comparison: rsHRF vs Legacy FC-empirical correlation", fontsize=15)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "best_fit_paired_scatter.png"), dpi=150)
+    plt.close()
+    print(f"  Saved: {os.path.join(out_dir, 'best_fit_paired_scatter.png')}")
+
+    # ── PLOT 2: differences in the model parameters at best fit — the
+    # PCorr Legacy/rsHRF values themselves, as a LINE plot: one line
+    # connecting Legacy's PCorr across subjects, one line connecting
+    # rsHRF's PCorr across subjects. Exactly 2 legend entries. ──
+    x = np.arange(len(subs_v))
+    fig2, ax2 = plt.subplots(figsize=(max(10, len(subs_v)*0.5), 6))
+
+    ax2.plot(x, r_leg_v, 'b-o', label='Legacy', markersize=6)
+    ax2.plot(x, r_hrf_v, 'r-o', label='rsHRF',  markersize=6)
+
+    ax2.set_xticks(x); ax2.set_xticklabels(subs_v, rotation=45, ha='right')
+    ax2.set_ylabel("Best-fit Pearson r (PCorr)")
+    ax2.set_title(f"PCorr at best fit — Legacy vs rsHRF — {dataset}")
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "best_fit_parameter_differences.png"), dpi=150)
+    plt.close()
+    print(f"  Saved: {os.path.join(out_dir, 'best_fit_parameter_differences.png')}")
+
+    print(f"  {len(subs_v)}/{len(subjects)} subject(s) included. Summary plots saved to: {out_dir}")
+
 def run_subject(dataset, sub_str):
     """Run full G sweep for one subject. Saves to results/<dataset>/<subject>."""
     print("\n" + "=" * 60)
@@ -663,9 +857,32 @@ if __name__ == '__main__':
                         help='OpenNeuro dataset id e.g. ds001226')
     parser.add_argument('--subject', type=str, default=None,
                         help='Run only this subject e.g. CON01')
+    parser.add_argument('--bold-only', action='store_true',
+                        help='Skip the G sweep; just simulate BOLD at one G '
+                             '(250 TRs, discard first 50) via simulate_bold_only()')
+    parser.add_argument('--G', type=float, default=0.81,
+                        help='G value to use with --bold-only (default 0.81)')
+    parser.add_argument('--summarize', action='store_true',
+                        help='Skip simulation; aggregate PCorr_legacy.txt / '
+                             'PCorr_rshrf.txt / G_values.txt across subjects '
+                             'into summary plots under results/<dataset>/summary/ '
+                             '(no summary.json involved). Combine with --subject '
+                             'to summarize a single subject, or omit it to use '
+                             'every subject with completed PCorr files.')
     args = parser.parse_args()
 
     subjects = [args.subject] if args.subject else ALL_SUBJECTS
+
+    if args.summarize:
+        summarize_subjects(args.dataset, subjects=[args.subject] if args.subject else None)
+        sys.exit(0)
+
+    if args.bold_only:
+        if not args.subject:
+            print("--bold-only requires --subject")
+            sys.exit(1)
+        simulate_bold_only(args.dataset, args.subject, G=args.G)
+        sys.exit(0)
 
     print(f"Running G sweep for dataset={args.dataset} "
           f"{len(subjects)} subject(s)")
