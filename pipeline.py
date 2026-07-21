@@ -164,11 +164,13 @@ def load_subject_data(dataset, sub_str):
     else:
         hrf_raw = None
 
+    roi_key = next(k for k in mat if k.endswith("ROIts_DK68"))
+    roi_ts  = mat[roi_key]   # empirical region timeseries, shape (T, N)
+
     if hrf_raw is None:
-        roi_key = next(k for k in mat if k.endswith("ROIts_DK68"))
         print(f"  HRF.mat missing/invalid for {sub_str} — generating via rsHRF "
-              f"from {roi_key} {mat[roi_key].shape}")
-        hrf_raw, _ = generate_hrf_mat(mat[roi_key], TR, hrf_mat_path, name=sub_str)
+              f"from {roi_key} {roi_ts.shape}")
+        hrf_raw, _ = generate_hrf_mat(roi_ts, TR, hrf_mat_path, name=sub_str)
 
     hrf_norm = hrf_raw / (np.max(np.abs(hrf_raw), axis=0, keepdims=True) + 1e-12)
     nan_regions = np.where(np.isnan(hrf_norm).any(axis=0))[0]
@@ -186,7 +188,7 @@ def load_subject_data(dataset, sub_str):
         emp_fc=emp_fc, TR=TR, weights=weights,
         tract_lengths=tract_lengths, hrf_compact=hrf_compact,
         N=N, BOLD_TR_ms=BOLD_TR_ms, total_dur_ms=total_dur_ms,
-        HRF_samples=hrf_compact.shape[0]
+        HRF_samples=hrf_compact.shape[0], roi_ts=roi_ts
     )
 
 dt            = 0.1
@@ -534,22 +536,131 @@ def select_best_G(G_values_sorted, r_values, tol=1e-3):
 # changing one can never silently change the other.
 BOLD_ONLY_DISCARD_TRS = 50
 
-def simulate_bold_only(dataset, sub_str, G=0.81):
+def default_G_values():
+    """The standard 16-point G sweep used by run_fc_sweep when
+    G_values isn't explicitly overridden."""
+    return sorted([(i / 10) + 0.01 for i in range(0, 31, 2)], reverse=True)
+
+def get_best_G_from_fc(dataset, sub_str, G_TOL=0.015):
     """
-    Fast path: simulate BOLD (Legacy BW + rsHRF) for ONE G value only,
-    and save the raw BOLD timeseries — no FC sweep, no Pearson
-    correlation against empirical FC. Skips the slow part (16 G values
-    x FC computation); useful for quickly inspecting/plotting
-    per-region BOLD traces.
+    Read G_values.txt / PCorr_legacy.txt / PCorr_rshrf.txt already saved
+    by a completed 'fc' mode run, and return (best_G_leg, best_G_hrf)
+    using the same select_best_G() rule as run_fc_sweep. Returns
+    (None, None) if those files don't exist yet.
+    """
+    out_dir  = results_dir(dataset, sub_str)
+    g_path   = os.path.join(out_dir, "G_values.txt")
+    leg_path = os.path.join(out_dir, "PCorr_legacy.txt")
+    hrf_path = os.path.join(out_dir, "PCorr_rshrf.txt")
+    if not (os.path.exists(g_path) and os.path.exists(leg_path) and os.path.exists(hrf_path)):
+        return None, None
 
-    BOLD convention: simulate 250 TRs, discard the first 50 -> 200 TRs
-    of settled BOLD saved to disk.
+    G_values     = np.loadtxt(g_path)
+    PCorr_legacy = np.loadtxt(leg_path)
+    PCorr_rshrf  = np.loadtxt(hrf_path)
+    asc_order = np.argsort(G_values)
+    G_asc     = list(G_values[asc_order])
+    r_leg_asc = list(PCorr_legacy[asc_order])
+    r_hrf_asc = list(PCorr_rshrf[asc_order])
 
-    Saves into the same results/<dataset>/<subject>/outputs/G_sweep/
-    folder as run_subject().
+    best_G_leg, _, _ = select_best_G(G_asc, r_leg_asc, tol=G_TOL)
+    best_G_hrf, _, _ = select_best_G(G_asc, r_hrf_asc, tol=G_TOL)
+    return best_G_leg, best_G_hrf
+
+def simulate_bold_one_G(args):
+    """Worker: simulate BOLD (Legacy BW + rsHRF) for ONE G value.
+    250 TRs simulated, first 50 discarded -> 200 TRs returned.
+    No FC computed here — this is BOLD generation only."""
+    (G, weights, tract_lengths, hrf_compact, BOLD_TR_ms, N) = args
+    bold_dur_ms = int(BOLD_TR_ms * 250)
+    try:
+        bold_leg_full = run_simulation(
+            G, weights, tract_lengths, hrf_compact,
+            bold_dur_ms, BOLD_TR_ms, N, mode='legacy')
+        bold_leg = bold_leg_full[:, BOLD_ONLY_DISCARD_TRS:]
+        del bold_leg_full
+
+        bold_hrf_full = run_simulation(
+            G, weights, tract_lengths, hrf_compact,
+            bold_dur_ms, BOLD_TR_ms, N, mode='rshrf')
+        bold_hrf = bold_hrf_full[:, BOLD_ONLY_DISCARD_TRS:]
+        del bold_hrf_full
+
+        print(f"  [BOLD] G={G:.2f} done  legacy={bold_leg.shape}  rshrf={bold_hrf.shape}", flush=True)
+        return G, bold_leg, bold_hrf
+    except Exception as e:
+        print(f"  [BOLD] G={G:.2f} FAILED: {e}", flush=True)
+        return G, None, None
+
+def _zscore(x):
+    x = np.asarray(x, dtype=float)
+    sd = x.std()
+    return (x - x.mean()) / sd if sd > 0 else x - x.mean()
+
+def plot_bold_region0_comparison(sub_str, emp_bold, bold_leg, bold_hrf, out_dir):
+    """
+    Region 0 only, z-scored, 3 stacked subplots: Empirical BOLD (top),
+    Legacy/BW (middle), rsHRF/canon2dd (bottom).
+    """
+    fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+
+    if emp_bold is not None:
+        emp_region0 = np.asarray(emp_bold)[:, 0]
+        axes[0].plot(_zscore(emp_region0), color='black')
+    axes[0].set_title("Empirical BOLD")
+
+    axes[1].plot(_zscore(bold_leg[0]), color='tab:blue')
+    axes[1].set_title("Legacy (BW)")
+
+    axes[2].plot(_zscore(bold_hrf[0]), color='tab:red')
+    axes[2].set_title("rsHRF (canon2dd)")
+
+    for ax in axes:
+        ax.set_ylabel("z-score")
+        ax.grid(True, alpha=0.3)
+    axes[-1].set_xlabel("Timepoint (TR)")
+    plt.suptitle(f"{sub_str} — Region 0 BOLD (z-scored)", fontsize=14)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "bold_region0_comparison.png"), dpi=150)
+    plt.close()
+    print(f"  Saved: {os.path.join(out_dir, 'bold_region0_comparison.png')}")
+
+def plot_bold_regions1to5(sub_str, bold_hrf, TR, out_dir):
+    """
+    Regions 1-5, rsHRF, ONE combined figure (5 lines overlaid). Input
+    is already 250-sim/50-discard'd, so the transient is already removed.
+    """
+    fig, ax = plt.subplots(figsize=(12, 5))
+    for r in range(1, 6):
+        ax.plot(bold_hrf[r], label=f"Region {r}")
+    ax.set_xlabel(f"Timepoints (TR={TR}s)")
+    ax.set_ylabel("BOLD signal")
+    ax.set_title(f"Simulated BOLD — {sub_str} rsHRF (canon2dd) — transient removed")
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "bold_regions1to5_transient_removed.png"), dpi=150)
+    plt.close()
+    print(f"  Saved: {os.path.join(out_dir, 'bold_regions1to5_transient_removed.png')}")
+
+def run_bold_sweep(dataset, sub_str, G_values=None):
+    """
+    Simulate BOLD ONLY at the optimal G for each method — best_G_leg for
+    Legacy, best_G_hrf for rsHRF, read from an already-completed 'fc'
+    mode run's PCorr files (via get_best_G_from_fc) — NOT at every G in
+    the 16-point sweep. Runs in parallel (ProcessPoolExecutor) across
+    however many distinct G's are actually needed (1 if both methods
+    share the same best G, 2 otherwise).
+
+    If G_values is given explicitly (i.e. --G was passed), that single
+    G is used for BOTH methods instead of each one's own best fit, and
+    the 'fc' sweep is not required to have been run first.
+
+    Saves exactly 2 plots to results/<dataset>/<subject>/outputs/G_sweep/:
+      - bold_region0_comparison.png             (Empirical/Legacy/rsHRF, Region 0)
+      - bold_regions1to5_transient_removed.png  (Regions 1-5, rsHRF, combined)
     """
     print("\n" + "=" * 60)
-    print(f"BOLD-ONLY  DATASET: {dataset}  SUBJECT: {sub_str}  G={G:.2f}")
+    print(f"BOLD  DATASET: {dataset}  SUBJECT: {sub_str}")
     print("=" * 60)
 
     out_dir = results_dir(dataset, sub_str)
@@ -567,32 +678,42 @@ def simulate_bold_only(dataset, sub_str, G=0.81):
     N             = d["N"]
     BOLD_TR_ms    = d["BOLD_TR_ms"]
     TR            = d["TR"]
+    emp_bold      = d.get("roi_ts")
 
-    bold_dur_ms = int(BOLD_TR_ms * 250)   # 250 TRs simulated, no debate
-    print(f"  N={N}  TR={TR}s  total_dur={bold_dur_ms}ms  G={G:.2f}")
+    if G_values is not None:
+        best_G_leg = best_G_hrf = G_values[0]
+    else:
+        best_G_leg, best_G_hrf = get_best_G_from_fc(dataset, sub_str)
+        if best_G_leg is None or best_G_hrf is None:
+            print(f"  No completed 'fc' sweep found for {sub_str} — run "
+                  f"--mode fc first (so best-fit G is known), or pass "
+                  f"--G explicitly to override.")
+            return
 
-    print("  Simulating Legacy (BW)...")
-    bold_leg_full = run_simulation(
-        G, weights, tract_lengths, hrf_compact,
-        bold_dur_ms, BOLD_TR_ms, N, mode='legacy')
-    bold_leg = bold_leg_full[:, BOLD_ONLY_DISCARD_TRS:]   # discard first 50
-    del bold_leg_full
+    print(f"  N={N}  TR={TR}s  best_G_leg={best_G_leg}  best_G_hrf={best_G_hrf}")
 
-    print("  Simulating rsHRF (canon2dd)...")
-    bold_hrf_full = run_simulation(
-        G, weights, tract_lengths, hrf_compact,
-        bold_dur_ms, BOLD_TR_ms, N, mode='rshrf')
-    bold_hrf = bold_hrf_full[:, BOLD_ONLY_DISCARD_TRS:]   # discard first 50
-    del bold_hrf_full
+    G_set = sorted(set([best_G_leg, best_G_hrf]))
+    task_args = [(G, weights, tract_lengths, hrf_compact, BOLD_TR_ms, N) for G in G_set]
+    n_workers = min(multiprocessing.cpu_count(), len(task_args))
 
-    np.save(os.path.join(out_dir, "bold_legacy_single_G.npy"), bold_leg)
-    np.save(os.path.join(out_dir, "bold_rshrf_single_G.npy"),  bold_hrf)
-    with open(os.path.join(out_dir, "bold_single_G_value.txt"), "w") as f:
-        f.write(f"{G}\n")
+    results_by_G = {}
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        futures = {executor.submit(simulate_bold_one_G, a): a[0] for a in task_args}
+        for future in as_completed(futures):
+            G, bold_leg, bold_hrf = future.result()
+            results_by_G[G] = (bold_leg, bold_hrf)
 
-    print(f"  Legacy BOLD shape: {bold_leg.shape}  rsHRF BOLD shape: {bold_hrf.shape}")
-    print(f"  Saved to: {out_dir}")
-    return bold_leg, bold_hrf
+    bold_leg_at_best = results_by_G[best_G_leg][0]
+    bold_hrf_at_best = results_by_G[best_G_hrf][1]
+
+    if bold_leg_at_best is None or bold_hrf_at_best is None:
+        print("  BOLD simulation failed — no plots produced.")
+        return
+
+    plot_bold_region0_comparison(sub_str, emp_bold, bold_leg_at_best, bold_hrf_at_best, out_dir)
+    plot_bold_regions1to5(sub_str, bold_hrf_at_best, TR, out_dir)
+
+    print(f"  Saved 2 BOLD plots to: {out_dir}")
 
 def summary_dir(dataset):
     return os.path.normpath(os.path.join(RESULTS_ROOT, dataset, "summary"))
@@ -600,12 +721,12 @@ def summary_dir(dataset):
 def summarize_subjects(dataset, subjects=None):
     """
     Aggregate across subjects using ONLY the per-subject files already
-    on disk from run_subject() — PCorr_legacy.txt, PCorr_rshrf.txt,
+    on disk from run_fc_sweep() — PCorr_legacy.txt, PCorr_rshrf.txt,
     G_values.txt. No summary.json needed or produced.
 
     Saves two plots under results/<dataset>/summary/:
       1. best_fit_paired_scatter.png — best-fit (max of the sweep
-         curve, same selection rule as run_subject's select_best_G)
+         curve, same selection rule as run_fc_sweep's select_best_G)
          Legacy PCorr vs rsHRF PCorr, one point per subject.
       2. best_fit_parameter_differences.png — the "model parameters"
          at best fit, meaning the PCorr Legacy/rsHRF values themselves:
@@ -722,8 +843,16 @@ def summarize_subjects(dataset, subjects=None):
 
     print(f"  {len(subs_v)}/{len(subjects)} subject(s) included. Summary plots saved to: {out_dir}")
 
-def run_subject(dataset, sub_str):
-    """Run full G sweep for one subject. Saves to results/<dataset>/<subject>."""
+def run_fc_sweep(dataset, sub_str, G_values=None):
+    """Run the FC sweep for one subject (hand-rolled DMF + BW / rsHRF,
+    no TVB/Subnetwork engine). Computes Pearson r vs empirical FC for
+    every G, selects each method's best-fit G, and saves
+    PCorr_legacy.txt / PCorr_rshrf.txt / G_values.txt / best_fc_*.npy /
+    G_sweep.png / fc_comparison.png to results/<dataset>/<subject>/.
+
+    G_values: list of G's to sweep, or None for the full default
+    16-point sweep (or a single-element list for one specific G).
+    """
     print("\n" + "=" * 60)
     print(f"DATASET: {dataset}  SUBJECT: {sub_str}")
     print("=" * 60)
@@ -731,8 +860,9 @@ def run_subject(dataset, sub_str):
     out_dir = results_dir(dataset, sub_str)
     os.makedirs(out_dir, exist_ok=True)
 
+    default_sweep = G_values is None
     done_file = os.path.join(out_dir, "PCorr_legacy.txt")
-    if os.path.exists(done_file):
+    if default_sweep and os.path.exists(done_file):
         print(f"  Already done — skipping. (delete {done_file} to re-run)")
         return
 
@@ -755,7 +885,8 @@ def run_subject(dataset, sub_str):
           f"total_dur={total_dur_ms}ms")
     print(f"  HRF range: [{hrf_compact.min():.4f}, {hrf_compact.max():.4f}]")
 
-    G_values  = sorted([(i/10)+0.01 for i in range(0, 31, 2)], reverse=True)
+    if G_values is None:
+        G_values = default_G_values()
     n_cores   = multiprocessing.cpu_count()
     n_workers = min(n_cores, len(G_values))
     print(f"  G sweep: {len(G_values)} values  workers={n_workers}/{n_cores}")
@@ -852,45 +983,56 @@ def run_subject(dataset, sub_str):
 
 if __name__ == '__main__':
     import argparse
-    parser = argparse.ArgumentParser(description='G sweep for all or one subject')
+    parser = argparse.ArgumentParser(
+        description='rsHRF-TVB pipeline: BOLD simulation, FC sweep + comparison, '
+                    'and cross-subject summary plots')
     parser.add_argument('--dataset', type=str, default='ds001226',
                         help='OpenNeuro dataset id e.g. ds001226')
     parser.add_argument('--subject', type=str, default=None,
-                        help='Run only this subject e.g. CON01')
-    parser.add_argument('--bold-only', action='store_true',
-                        help='Skip the G sweep; just simulate BOLD at one G '
-                             '(250 TRs, discard first 50) via simulate_bold_only()')
-    parser.add_argument('--G', type=float, default=0.81,
-                        help='G value to use with --bold-only (default 0.81)')
-    parser.add_argument('--summarize', action='store_true',
-                        help='Skip simulation; aggregate PCorr_legacy.txt / '
-                             'PCorr_rshrf.txt / G_values.txt across subjects '
-                             'into summary plots under results/<dataset>/summary/ '
-                             '(no summary.json involved). Combine with --subject '
-                             'to summarize a single subject, or omit it to use '
-                             'every subject with completed PCorr files.')
+                        help='Run only this subject e.g. CON01; omit to run all subjects')
+    parser.add_argument('--G', type=float, default=None,
+                        help="Explicit G value override. For 'fc' mode: restrict the "
+                             "sweep to just this one G (omit for the full 16-point "
+                             "default sweep). For 'bold' mode: use this one G for both "
+                             "Legacy and rsHRF instead of each method's own best-fit G "
+                             "(omit to use best-fit G's from a completed 'fc' sweep).")
+    parser.add_argument('--mode', type=str, nargs='+', choices=['bold', 'fc', 'summary'],
+                        default=['bold', 'fc'],
+                        help="Which stage(s) to run, space-separated. "
+                             "'bold': simulate BOLD (Legacy+rsHRF) ONLY at each method's "
+                             "own best-fit G (read from a completed 'fc' sweep; pass --G "
+                             "to override with one explicit G for both methods instead). "
+                             "Produces exactly 2 plots: bold_region0_comparison.png "
+                             "(Empirical/Legacy/rsHRF, Region 0) and "
+                             "bold_regions1to5_transient_removed.png (Regions 1-5, rsHRF). "
+                             "'fc': FC sweep + fc_comparison.png (hand-rolled DMF+BW/rsHRF, "
+                             "no TVB/Subnetwork engine). "
+                             "'summary': aggregate PCorr files across subjects into "
+                             "summary plots under results/<dataset>/summary/ (no "
+                             "summary.json). Default (no --mode given): 'fc' runs first, "
+                             "then 'bold' (so bold mode always has a best-fit G to use). "
+                             "'summary' does not run unless explicitly selected.")
     args = parser.parse_args()
 
     subjects = [args.subject] if args.subject else ALL_SUBJECTS
+    G_values = [args.G] if args.G is not None else None
 
-    if args.summarize:
+    if 'summary' in args.mode:
         summarize_subjects(args.dataset, subjects=[args.subject] if args.subject else None)
-        sys.exit(0)
 
-    if args.bold_only:
-        if not args.subject:
-            print("--bold-only requires --subject")
-            sys.exit(1)
-        simulate_bold_only(args.dataset, args.subject, G=args.G)
-        sys.exit(0)
+    sim_modes = [m for m in args.mode if m in ('bold', 'fc')]
+    if sim_modes:
+        print(f"Running mode(s)={sim_modes}  dataset={args.dataset}  "
+              f"{len(subjects)} subject(s)"
+              + (f"  G={args.G}" if args.G is not None else "  (full G sweep)"))
+        for sub in subjects:
+            try:
+                if 'fc' in sim_modes:
+                    run_fc_sweep(args.dataset, sub, G_values=G_values)
+                if 'bold' in sim_modes:
+                    run_bold_sweep(args.dataset, sub, G_values=G_values)
+            except Exception as e:
+                print(f"SUBJECT {sub} FAILED: {e}")
+                continue
 
-    print(f"Running G sweep for dataset={args.dataset} "
-          f"{len(subjects)} subject(s)")
-    for sub in subjects:
-        try:
-            run_subject(args.dataset, sub)
-        except Exception as e:
-            print(f"SUBJECT {sub} FAILED: {e}")
-            continue
-
-    print("\nALL SUBJECTS DONE")
+    print("\nALL DONE")
