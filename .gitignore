@@ -4,3 +4,4 @@ venv/
 datasets/*
 !datasets/.gitkeep
 tvb-root
+results/**/outputs/G_sweep/bold_*_G*.npy

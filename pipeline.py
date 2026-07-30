@@ -654,6 +654,31 @@ def get_best_G_from_fc(dataset, sub_str, G_TOL=0.015):
     best_G_hrf, _, _ = select_best_G(G_asc, r_hrf_asc, tol=G_TOL, strength_values=strength_hrf_asc)
     return best_G_leg, best_G_hrf
 
+def get_max_rshrf_G(dataset, sub_str, G_TOL=0.015):
+    """
+    Read G_values.txt / PCorr_rshrf.txt from a completed 'fc' sweep
+    (row-by-row mapping, same order in both files) and return rsHRF's
+    best-fit G using the SAME tolerance-based "smallest G within tol of
+    the max" rule as select_best_G()/get_best_G_from_fc() — i.e. the
+    same rule 'bold' mode uses for rsHRF's own G, NOT a literal argmax.
+    Used by 'signal' mode to pick ONE single G (shared by both Legacy
+    and rsHRF). Returns None if the required files don't exist yet.
+    """
+    out_dir  = results_dir(dataset, sub_str)
+    g_path   = os.path.join(out_dir, "G_values.txt")
+    hrf_path = os.path.join(out_dir, "PCorr_rshrf.txt")
+    if not (os.path.exists(g_path) and os.path.exists(hrf_path)):
+        return None
+
+    G_values    = np.loadtxt(g_path)
+    PCorr_rshrf = np.loadtxt(hrf_path)
+    asc_order = np.argsort(G_values)
+    G_asc = list(G_values[asc_order])
+    p_asc = list(PCorr_rshrf[asc_order])
+
+    best_G, _, _ = select_best_G(G_asc, p_asc, tol=G_TOL)
+    return best_G
+
 def bold_cache_paths(out_dir, G):
     """Filenames for the small per-G BOLD cache (see load_cached_bold /
     save_bold_cache) — NOT the old full-16-G-sweep .npy dump. Only ever
@@ -946,21 +971,27 @@ def run_signal_analysis(dataset, sub_str, G=None):
     relative power spectrum (Empirical, Legacy, and rsHRF), averaged
     across ALL regions.
 
-    Treated as a step that runs AFTER 'fc' (and conceptually after
-    'bold', though it doesn't read bold mode's output — it resolves its
-    own G and simulates independently so it can also be invoked on its
-    own). G resolution matches 'bold' mode exactly: each method's own
-    best-fit G from a completed 'fc' sweep (via get_best_G_from_fc),
-    unless G is given explicitly (i.e. --G was passed), in which case
-    that one G is used for both methods and no 'fc' sweep is required.
-    Simulated BOLD is cached to/read from disk (see simulate_bold_at_Gs)
-    so repeat calls, or a prior 'bold' mode run at the same G, avoid
+    Genuinely self-sufficient: if G isn't given explicitly and no 'fc'
+    sweep has been run yet for this subject (G_values.txt/
+    PCorr_rshrf.txt missing), 'fc' is run automatically first so rsHRF's
+    best-fit G can be resolved — this never stops at a partial result
+    (HRF shape only, no spectrum) just because 'fc' hadn't run yet.
+    Unless G is given explicitly (i.e. --G was passed), in which case
+    that G is used directly and no 'fc' sweep runs at all. Simulated
+    BOLD is cached to/read from disk (see simulate_bold_at_Gs) so
+    repeat calls, or a prior 'bold' mode run at the same G, avoid
     resimulating.
+
+    G resolution rule (when not overridden by --G): rsHRF's own
+    best-fit G, via get_max_rshrf_G — the same tolerance-based
+    "smallest G within tol of the max" rule 'bold' mode uses for
+    rsHRF's G (not a literal argmax). Used as a SINGLE G for both
+    Legacy and rsHRF simulations here.
 
     Saves to results/<dataset>/<subject>/outputs/G_sweep/:
       - hrf_shape_region0.png    (no simulation needed)
       - bold_spectrum_global.png (Empirical/Legacy/rsHRF, averaged
-        across all regions, relative power)
+        across all regions, relative power, all at the one chosen G)
     """
     print("\n" + "=" * 60)
     print(f"SIGNAL  DATASET: {dataset}  SUBJECT: {sub_str}")
@@ -986,30 +1017,33 @@ def run_signal_analysis(dataset, sub_str, G=None):
     plot_hrf_shape(sub_str, hrf_compact, TR, out_dir)
 
     if G is not None:
-        best_G_leg = best_G_hrf = G
+        chosen_G = G
     else:
-        best_G_leg, best_G_hrf = get_best_G_from_fc(dataset, sub_str)
-        if best_G_leg is None or best_G_hrf is None:
-            print(f"  No completed 'fc' sweep found for {sub_str} — run "
-                  f"--mode fc first (so best-fit G is known), or pass "
-                  f"--G explicitly to override. HRF shape plot was still "
-                  f"saved (needs no simulation); spectrum plot skipped.")
-            return
+        chosen_G = get_max_rshrf_G(dataset, sub_str)
+        if chosen_G is None:
+            print(f"  No completed 'fc' sweep found for {sub_str} — running "
+                  f"'fc' now so rsHRF's best-fit G can be resolved...")
+            run_fc_sweep(dataset, sub_str)
+            chosen_G = get_max_rshrf_G(dataset, sub_str)
+            if chosen_G is None:
+                print(f"  'fc' sweep did not produce usable PCorr results for "
+                      f"{sub_str} — cannot resolve G. Pass --G explicitly to "
+                      f"override.")
+                return
 
-    print(f"  best_G_leg={best_G_leg}  best_G_hrf={best_G_hrf}")
+    print(f"  signal mode G={chosen_G}  (rsHRF best-fit G, tolerance-based)")
 
-    G_set = sorted(set([best_G_leg, best_G_hrf]))
-    results_by_G = simulate_bold_at_Gs(G_set, weights, tract_lengths, hrf_compact, BOLD_TR_ms, N, out_dir)
+    results_by_G = simulate_bold_at_Gs([chosen_G], weights, tract_lengths, hrf_compact, BOLD_TR_ms, N, out_dir)
+    bold_leg_at_chosen = results_by_G[chosen_G][0]
+    bold_hrf_at_chosen = results_by_G[chosen_G][1]
 
-    bold_leg_at_best = results_by_G[best_G_leg][0]
-    bold_hrf_at_best = results_by_G[best_G_hrf][1]
-
-    if bold_leg_at_best is None or bold_hrf_at_best is None:
+    if bold_leg_at_chosen is None or bold_hrf_at_chosen is None:
         print("  BOLD simulation failed — spectrum plot skipped.")
         return
 
-    plot_bold_spectrum(sub_str, emp_bold, bold_leg_at_best, bold_hrf_at_best, TR, out_dir)
+    plot_bold_spectrum(sub_str, emp_bold, bold_leg_at_chosen, bold_hrf_at_chosen, TR, out_dir)
     print(f"  Signal analysis plots saved to: {out_dir}")
+
 
 def summary_dir(dataset):
     return os.path.normpath(os.path.join(RESULTS_ROOT, dataset, "summary"))
@@ -1321,12 +1355,13 @@ if __name__ == '__main__':
                              "'signal': HRF shape (Region 0, hrf_shape_region0.png) and a "
                              "global-signal relative power spectrum — Empirical, Legacy, "
                              "and rsHRF, averaged across ALL regions "
-                             "(bold_spectrum_global.png). "
-                             "Treated as a step performed after 'fc' and 'bold' are "
-                             "done, but resolves its own best-fit G independently (same "
-                             "rule as 'bold') so it can also be run entirely on its own — "
-                             "pass --G to skip the 'fc' dependency, or --subject to target "
-                             "one subject. "
+                             "(bold_spectrum_global.png), all simulated at ONE single G: "
+                             "rsHRF's best-fit G (same tolerance-based rule 'bold' mode "
+                             "uses for rsHRF's G). If no 'fc' sweep has been run yet for "
+                             "the subject, 'fc' runs automatically first so this G can be "
+                             "resolved -- self-sufficient, never stops at a partial result. "
+                             "Pass --G to override with an explicit G instead (skips the "
+                             "'fc' run entirely), or --subject to target one subject. "
                              "'summary': aggregate PCorr files across subjects into "
                              "summary plots under results/<dataset>/summary/ (no "
                              "summary.json). Default (no --mode given): 'fc', then "
