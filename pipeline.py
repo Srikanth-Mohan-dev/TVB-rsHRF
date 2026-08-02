@@ -7,6 +7,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import zipfile
 from scipy import stats
+from scipy import sparse as sp
 from scipy.signal import resample as scipy_resample
 from scipy.signal import welch
 import matplotlib
@@ -271,6 +272,202 @@ def prepare_sc(weights, tract_lengths, G, global_v=12_500.0):
     delays = np.clip(delays, 1, int(raw_delays.max()) + 1)
     return cap, delays
 
+# ═══════════════════════════════════════════════════════════════
+# TVB-NATIVE SIMULATION ENGINE — hybrid-numba API, per
+# https://github.com/the-virtual-brain/tvb-root/blob/hybrid-numba/
+#         tvb_documentation/demos/simulate_hybrid_getting_started.ipynb
+#
+# Uses TVB's real ReducedWongWangExcInh model + hybrid Simulator API
+# (Subnetwork / NetworkSet / IntraProjection) instead of a hand-rolled
+# S_E/S_I loop. Returns the raw neural (S_e) trace only — BOLD is a
+# separate post-processing step applied afterward, so THIS ENGINE IS
+# SHARED by both the legacy and rshrf paths:
+#   - legacy : bw_from_timeseries()        (Balloon-Windkessel)
+#   - rshrf  : rshrf_bold_from_timeseries() (rsHRF convolution)
+#
+# ReducedWongWangExcInh has no dynamic-FIC hook (J_i is a static trait
+# param fixed at 1.0), so neither path has dynamic FIC here — legacy
+# and rshrf differ ONLY in which BOLD-derivation function is applied
+# to the (identical, for a given G) S_e trace. This is a deliberate
+# choice: rsHRF loses its dynamic FIC in exchange for sharing this
+# engine with legacy.
+# ═══════════════════════════════════════════════════════════════
+def run_tvb_legacy_simulation(G, weights, tract_lengths, total_dur_ms, N,
+                              rand_seed=1403):
+    """
+    Runs ReducedWongWangExcInh via TVB's real hybrid Simulator API.
+    Returns the raw S_e timeseries (T, N) at 1ms resolution; BOLD is
+    derived afterward via bw_from_timeseries() (legacy) or
+    rshrf_bold_from_timeseries() (rshrf) — both reuse this same trace.
+    """
+    from tvb.simulator.models import ReducedWongWangExcInh
+    from tvb.simulator.integrators import HeunStochastic
+    import tvb.simulator.noise as tvb_noise
+    from tvb.simulator.hybrid import Subnetwork, NetworkSet, Simulator, IntraProjection
+    from tvb.simulator.monitors import TemporalAverage
+
+    np.random.seed(rand_seed)
+    dt_tvb = dt   # 0.1ms — same neural-integration step as the hand-rolled model
+
+    # Model: defaults already match the C constants almost exactly;
+    # set explicitly for clarity. G is the only value that varies
+    # across the sweep.
+    model = ReducedWongWangExcInh(
+        a_e=np.array([a_E]),       b_e=np.array([b_E]),    d_e=np.array([d_E]),
+        gamma_e=np.array([gamma]), tau_e=np.array([tau_E]),
+        a_i=np.array([a_I]),       b_i=np.array([b_I]),    d_i=np.array([d_I]),
+        gamma_i=np.array([gamma_I]),   tau_i=np.array([tau_I]),
+        J_N=np.array([J_NMDA]),    w_p=np.array([w_plus]),
+        I_o=np.array([I_0]),       W_e=np.array([w_E]),    W_i=np.array([w_I]),
+        J_i=np.array([1.0]),       # static, no FIC — shared by both paths
+        I_ext=np.array([0.0]),     lamda=np.array([0.0]),
+        G=np.array([G]),
+    )
+    model.configure()
+
+    # nsig: Additive's stochastic term is sqrt(dt)*sqrt(2*nsig)*randn();
+    # ours is sigma*sqrt(dt)*randn(). Equating: nsig = sigma^2/2.
+    nsig_equivalent = (sigma ** 2) / 2.0
+    integrator = HeunStochastic(
+        dt=dt_tvb,
+        noise=tvb_noise.Additive(nsig=np.array([nsig_equivalent])),
+    )
+
+    # Projection: raw weighted SC sum; G*J_N is applied INSIDE the
+    # model's dfun (cc = G * J_N * Coupling_Term), so scale=1.0 here —
+    # NOT G*J_NMDA, which would double-apply J_NMDA.
+    # model.cvar=[0] -> state_variables[0]='S_e'.
+    S_E_CVAR_IDX = 0
+    weights_sparse = sp.csr_matrix(weights.astype(np.float64))
+    lengths_sparse = sp.csr_matrix(tract_lengths.astype(np.float64))
+
+    sc_projection = IntraProjection(
+        source_cvar=np.array([S_E_CVAR_IDX]),
+        target_cvar=np.array([S_E_CVAR_IDX]),
+        weights=weights_sparse,
+        lengths=lengths_sparse,
+        cv=12.5,       # m/s — matches the validated delay structure
+        dt=dt_tvb,     # must match integrator dt
+        scale=1.0,
+    )
+
+    cortex = Subnetwork(
+        name='cortex', model=model, scheme=integrator,
+        nnodes=N, projections=[sc_projection],
+    )
+    nets = NetworkSet(subnets=[cortex], projections=[])
+
+    # Raw S_e/S_i trace at 1ms resolution; BOLD applied afterward by
+    # the validated code below (NOT TVB's own Bold monitor, which uses
+    # a different internal HRF convolution).
+    ta_monitor = TemporalAverage(period=1.0)   # ms
+
+    sim = Simulator(nets=nets, simulation_length=float(total_dur_ms),
+                    monitors=[ta_monitor])
+    sim.configure()
+
+    print(f"  [tvb_legacy] Simulating {total_dur_ms} ms  G={G:.2f}", flush=True)
+    result = sim.run(random_state=rand_seed)
+
+    # TemporalAverage output shape (T, num_vars, num_nodes, num_modes).
+    times, data = result[0]
+    data = np.asarray(data)
+    if data.ndim == 4:
+        S_E_timeseries = data[:, 0, :, 0]   # voi 0 = S_e, mode 0
+    elif data.ndim == 3:
+        S_E_timeseries = data[:, 0, :]
+    else:
+        raise ValueError(f"Unexpected monitor data shape: {data.shape}")
+
+    return S_E_timeseries
+
+def bw_from_timeseries(S_E_timeseries, N, BOLD_TR_ms):
+    """
+    Runs the validated Balloon-Windkessel model on a (T,N) S_E trace
+    sampled at 1ms resolution. TR sample = average over the TR window
+    (not a point-sample, which aliases sub-TR ripple into visible
+    low-frequency "noise" — same de-aliasing fix applied to the
+    hand-rolled model's mode='legacy' BOLD sampling).
+    """
+    total_steps_ms = S_E_timeseries.shape[0]
+    BOLD_TS_len    = total_steps_ms // BOLD_TR_ms
+
+    bw_x  = np.zeros(N, dtype=np.float32)
+    bw_f  = np.ones(N, dtype=np.float32)
+    bw_nu = np.ones(N, dtype=np.float32)
+    bw_q  = np.ones(N, dtype=np.float32)
+    bold_accum = np.zeros(N, dtype=np.float32)
+    BOLD_out = np.zeros((N, BOLD_TS_len), dtype=np.float32)
+    bold_t = 0
+
+    md  = np.float32(model_dt)
+    kp  = np.float32(kappa)
+    yy  = np.float32(y_bw)
+    it  = np.float32(itau_bw)
+    ia  = np.float32(ialpha)
+    rr  = np.float32(rho)
+    omr = np.float32(oneminrho)
+
+    for ts in range(total_steps_ms):
+        S_E = S_E_timeseries[ts]
+        for j in range(N):
+            se  = np.float32(S_E[j])
+            bx  = np.float32(bw_x[j]); bf = np.float32(bw_f[j])
+            bnu = np.float32(bw_nu[j]); bq = np.float32(bw_q[j])
+            bx  = np.float32(bx + md * (se - kp * bx - yy * (bf - np.float32(1.0))))
+            ft  = np.float32(bf + md * bx)
+            bnu = np.float32(bnu + md * it * (bf - np.float32(np.power(np.float32(bnu), ia))))
+            bq  = np.float32(bq + md * it * (
+                np.float32(bf * (np.float32(1.0) - np.float32(np.power(omr, np.float32(1.0) / bf))) / rr)
+                - np.float32(np.float32(np.power(np.float32(bnu), ia)) * bq / bnu)))
+            bw_x[j], bw_f[j], bw_nu[j], bw_q[j] = bx, ft, bnu, bq
+
+            bold_accum[j] += np.float32(
+                np.float32(100.0) / np.float32(rho) * np.float32(V_0) * (
+                    np.float32(k1) * (np.float32(1.0) - bq)
+                    + np.float32(k2) * (np.float32(1.0) - bq / bnu)
+                    + np.float32(k3) * (np.float32(1.0) - bnu)))
+
+        if (ts + 1) % BOLD_TR_ms == 0 and bold_t < BOLD_TS_len:
+            BOLD_out[:, bold_t] = bold_accum / np.float32(BOLD_TR_ms)
+            bold_accum[:] = 0.0
+            bold_t += 1
+
+    return BOLD_out
+
+def rshrf_bold_from_timeseries(S_E_timeseries, N, BOLD_TR_ms, hrf_compact):
+    """
+    Applies the rsHRF dot-product convolution BOLD derivation to a
+    (T, N) S_e trace at 1ms resolution — post-hoc version of the
+    hand-rolled model's streaming ring-buffer convolution, numerically
+    equivalent. Used on top of the Subnetwork hybrid-numba TVB neural
+    trace: since the stock ReducedWongWangExcInh model has no dynamic
+    FIC, "legacy" and "rshrf" share IDENTICAL S_e dynamics from the
+    same TVB run and differ ONLY in this BOLD-derivation step
+    (Balloon-Windkessel vs rsHRF convolution) — see
+    bw_from_timeseries() for the other side.
+    """
+    total_steps_ms = S_E_timeseries.shape[0]
+    BOLD_TS_len    = total_steps_ms // BOLD_TR_ms
+
+    HRF_rs = resample_hrf_for_conv(hrf_compact, N, stock_steps)
+
+    # Zero-pad the front by (stock_steps - 1) samples — matches the
+    # hand-rolled ring buffer, which starts zero-initialized and only
+    # fills with real S_e values as the simulation progresses.
+    S_pad = np.zeros((stock_steps - 1 + total_steps_ms, N), dtype=np.float64)
+    S_pad[stock_steps - 1:] = S_E_timeseries
+
+    BOLD_out = np.zeros((N, BOLD_TS_len), dtype=np.float32)
+    bold_t = 0
+    for ts in range(total_steps_ms):
+        if (ts + 1) % BOLD_TR_ms == 0 and bold_t < BOLD_TS_len:
+            window = S_pad[ts:ts + stock_steps]   # (stock_steps, N), chronological, ending at ts
+            BOLD_out[:, bold_t] = np.einsum('ti,ti->i', window, HRF_rs)
+            bold_t += 1
+
+    return BOLD_out
+
 def run_simulation(G, weights, tract_lengths, hrf_compact,
                    total_dur_ms, BOLD_TR_ms, N,
                    J_NMDA=0.150, w_plus=1.400, tmpJi=1.000,
@@ -293,6 +490,12 @@ def run_simulation(G, weights, tract_lengths, hrf_compact,
     this change trades exact reference-parity for a de-aliased signal.
     Flagging this explicitly since the line above claims C-verification
     and this specific behavior is no longer a literal match.
+
+    NOTE (2): as of this revert, this hand-rolled function is DEAD CODE
+    — no call site uses it anymore. run_one_G/simulate_bold_one_G now
+    use the Subnetwork/hybrid-numba TVB engine (run_tvb_legacy_simulation
+    above) for BOTH legacy and rshrf, per explicit instruction. This
+    function is kept only for reference/potential future use.
     """
     np.random.seed(rand_seed)
 
@@ -509,22 +712,27 @@ def fc_strength(sim_fc, N):
     return float(np.mean(sim_fc[uidx]))
 
 def run_one_G(args):
-    """Worker: runs legacy + rsHRF for one G value. Returns all results,
-    including each method's FC strength (see fc_strength() above)."""
+    """Worker: runs the Subnetwork hybrid-numba TVB engine ONCE per G,
+    then derives BOTH BOLD variants (legacy via Balloon-Windkessel,
+    rshrf via rsHRF convolution) from that single S_e trace — the
+    stock model has no dynamic FIC, so legacy/rshrf neural dynamics
+    are identical for a given G; they only diverge at the BOLD-
+    derivation step. Returns all results including each method's FC
+    strength (see fc_strength() above)."""
     (G, weights, tract_lengths, hrf_compact,
      total_dur_ms, BOLD_TR_ms, N, emp_fc, TR) = args
     try:
-        bold_leg = run_simulation(
-            G, weights, tract_lengths, hrf_compact,
-            total_dur_ms, BOLD_TR_ms, N, mode='legacy')
+        S_E_tvb = run_tvb_legacy_simulation(G, weights, tract_lengths, total_dur_ms, N)
+
+        bold_leg = bw_from_timeseries(S_E_tvb, N, BOLD_TR_ms)
         r_leg, sim_fc_leg = get_fc_correlation(bold_leg, emp_fc, TR, N)
         strength_leg = fc_strength(sim_fc_leg, N)
+        del bold_leg
 
-        bold_hrf = run_simulation(
-            G, weights, tract_lengths, hrf_compact,
-            total_dur_ms, BOLD_TR_ms, N, mode='rshrf')
+        bold_hrf = rshrf_bold_from_timeseries(S_E_tvb, N, BOLD_TR_ms, hrf_compact)
         r_hrf, sim_fc_hrf = get_fc_correlation(bold_hrf, emp_fc, TR, N)
         strength_hrf = fc_strength(sim_fc_hrf, N)
+        del bold_hrf, S_E_tvb
 
         print(f"  G={G:.2f}  Legacy r={r_leg:.4f} (strength={strength_leg:.3f})  "
               f"rsHRF r={r_hrf:.4f} (strength={strength_hrf:.3f})", flush=True)
@@ -729,23 +937,23 @@ def simulate_bold_at_Gs(G_set, weights, tract_lengths, hrf_compact, BOLD_TR_ms, 
     return results_by_G
 
 def simulate_bold_one_G(args):
-    """Worker: simulate BOLD (Legacy BW + rsHRF) for ONE G value.
-    250 TRs simulated, first 50 discarded -> 200 TRs returned.
-    No FC computed here — this is BOLD generation only."""
+    """Worker: simulate BOLD for ONE G value via the Subnetwork
+    hybrid-numba TVB engine (one neural run, both BOLD variants
+    derived from it — Legacy via Balloon-Windkessel, rshrf via rsHRF
+    convolution). 250 TRs simulated, first 50 discarded -> 200 TRs
+    returned. No FC computed here — this is BOLD generation only."""
     (G, weights, tract_lengths, hrf_compact, BOLD_TR_ms, N) = args
     bold_dur_ms = int(BOLD_TR_ms * 250)
     try:
-        bold_leg_full = run_simulation(
-            G, weights, tract_lengths, hrf_compact,
-            bold_dur_ms, BOLD_TR_ms, N, mode='legacy')
+        S_E_tvb = run_tvb_legacy_simulation(G, weights, tract_lengths, bold_dur_ms, N)
+
+        bold_leg_full = bw_from_timeseries(S_E_tvb, N, BOLD_TR_ms)
         bold_leg = bold_leg_full[:, BOLD_ONLY_DISCARD_TRS:]
         del bold_leg_full
 
-        bold_hrf_full = run_simulation(
-            G, weights, tract_lengths, hrf_compact,
-            bold_dur_ms, BOLD_TR_ms, N, mode='rshrf')
+        bold_hrf_full = rshrf_bold_from_timeseries(S_E_tvb, N, BOLD_TR_ms, hrf_compact)
         bold_hrf = bold_hrf_full[:, BOLD_ONLY_DISCARD_TRS:]
-        del bold_hrf_full
+        del bold_hrf_full, S_E_tvb
 
         print(f"  [BOLD] G={G:.2f} done  legacy={bold_leg.shape}  rshrf={bold_hrf.shape}", flush=True)
         return G, bold_leg, bold_hrf
@@ -788,7 +996,7 @@ def plot_bold_region0_comparison(sub_str, emp_bold, bold_leg, bold_hrf, out_dir)
     axes[0].set_title("Empirical BOLD")
 
     axes[1].plot(_zscore(leg_region0[:T_common]), color='tab:blue')
-    axes[1].set_title("Legacy (BW)")
+    axes[1].set_title("Legacy (Subnetwork TVB)")
 
     axes[2].plot(_zscore(hrf_region0[:T_common]), color='tab:red')
     axes[2].set_title("rsHRF (canon2dd)")
@@ -948,7 +1156,7 @@ def plot_bold_spectrum(sub_str, emp_bold, bold_leg, bold_hrf, TR, out_dir):
         ax.plot(f_emp, p_emp, color='black', label='Empirical BOLD')
 
     f_leg, p_leg = _avg_relative_psd(bold_leg)
-    ax.plot(f_leg, p_leg, color='tab:blue', label='Legacy (BW)')
+    ax.plot(f_leg, p_leg, color='tab:blue', label='Legacy (Subnetwork TVB)')
 
     f_hrf, p_hrf = _avg_relative_psd(bold_hrf)
     ax.plot(f_hrf, p_hrf, color='tab:red', label='rsHRF (canon2dd)')
@@ -1122,7 +1330,7 @@ def summarize_subjects(dataset, subjects=None):
     out_dir = summary_dir(dataset)
     os.makedirs(out_dir, exist_ok=True)
 
-    # ── PLOT 1: paired scatter — rsHRF (canon2dd) vs Legacy (BW),
+    # ── PLOT 1: paired scatter — rsHRF (canon2dd) vs Legacy (Subnetwork TVB),
     # best-fit (max of sweep curve). TWO SIDE-BY-SIDE PANELS, one per
     # group (Controls, Patients), each with its own "Equal performance"
     # diagonal and a vertical connector from each point down to that
@@ -1146,7 +1354,7 @@ def summarize_subjects(dataset, subjects=None):
         for rli, rhi in zip(rl, rh):
             axg.plot([rli, rli], [rli, rhi], color=color, linewidth=1, alpha=0.5, zorder=1)
         axg.scatter(rl, rh, color=color, s=70, edgecolor='none', zorder=2)
-        axg.set_xlabel("Legacy (BW) — Pearson r")
+        axg.set_xlabel("Legacy (Subnetwork TVB) — Pearson r")
         axg.set_ylabel("rsHRF (canon2dd) — Pearson r")
         axg.set_title(subtitle)
         axg.set_xlim(lo, hi); axg.set_ylim(lo, hi)
@@ -1296,7 +1504,7 @@ def run_fc_sweep(dataset, sub_str, G_values=None):
         print(f"    G={G:.2f}  legacy={rl:.4f}  rsHRF={rr:.4f}")
 
     fig, ax = plt.subplots(figsize=(12, 5))
-    ax.plot(G_values, PCorr_legacy, 'b-o', label='Legacy (BW)',     markersize=6)
+    ax.plot(G_values, PCorr_legacy, 'b-o', label='Legacy (Subnetwork TVB)',     markersize=6)
     ax.plot(G_values, PCorr_rshrf,  'r-o', label='rsHRF (canon2dd)',markersize=6)
     ax.set_xlabel("Global Coupling G"); ax.set_ylabel("Pearson r")
     ax.set_title(f"G Sweep — {sub_str}")
@@ -1310,7 +1518,7 @@ def run_fc_sweep(dataset, sub_str, G_values=None):
         axes[0].imshow(emp_fc, cmap='RdBu_r', vmin=-1, vmax=1)
         axes[0].set_title("Empirical FC\n(ground truth)")
         im1 = axes[1].imshow(best_fc_leg, cmap='RdBu_r', vmin=-1, vmax=1)
-        axes[1].set_title(f"Legacy (BW)\nr={best_r_leg:.3f} vs empirical  "
+        axes[1].set_title(f"Legacy (Subnetwork TVB)\nr={best_r_leg:.3f} vs empirical  "
                           f"r={r_leg_sc:.3f} vs SC\nG={best_G_leg:.2f}")
         plt.colorbar(im1, ax=axes[1])
         axes[2].imshow(weights, cmap='hot')
