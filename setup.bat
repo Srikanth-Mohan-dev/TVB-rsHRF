@@ -4,10 +4,11 @@ setlocal enabledelayedexpansion
 set "SCRIPT_DIR=%~dp0"
 cd /d "%SCRIPT_DIR%"
 
-set "VENV_DIR=%SCRIPT_DIR%venv"
+set "VENV_DIR=%SCRIPT_DIR%venv-develop-rshrf"
 
 echo ============================================================
 echo Setting up environment in %SCRIPT_DIR%
+echo (venv-develop-rshrf -- separate from the main venv)
 echo ============================================================
 
 where python >nul 2>nul
@@ -53,8 +54,11 @@ if not exist results mkdir results
 echo.
 echo ============================================================
 echo Done. To use this environment:
-echo   venv\Scripts\activate.bat
+echo   venv-develop-rshrf\Scripts\activate.bat
 echo   python pipeline.py --dataset ds001226 --subject CON01
 echo ============================================================
+echo.
+echo NOTE: your original 'venv' folder (if it exists) is untouched --
+echo this script only creates/uses 'venv-develop-rshrf'.
 
 endlocal

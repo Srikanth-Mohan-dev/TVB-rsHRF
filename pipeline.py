@@ -118,6 +118,20 @@ def generate_hrf_mat(roi_ts, TR, out_path, name="generated", p_jobs=1):
         np.fix(para['max_onset_search'] / para['dt']) + 1,
         dtype='int')
 
+    # rsHRF >= develop moved localK's default out of demo_rsHRF() and into
+    # a separate apply_localK_default(para) the caller must invoke (it's
+    # now TR-dependent instead of a fixed constant) -- without this,
+    # demo_rsHRF raises KeyError('localK'). Use it when available; fall
+    # back to the old fixed default (1) on older/stable rsHRF installs
+    # that don't have this function, so this works on either version.
+    try:
+        from rsHRF.utils.hrf_estimation import apply_localK_default
+        para.setdefault('localK', None)   # apply_localK_default only fills it
+                                           # in if it's already present as None
+        apply_localK_default(para)
+    except ImportError:
+        para.setdefault('localK', 1)
+
     fourD_rsHRF.demo_rsHRF(
         input_file=csv_path,
         mask_file=None,
@@ -318,14 +332,7 @@ def run_simulation(G, weights, tract_lengths, hrf_compact,
     bw_f  = np.ones(N, dtype=np.float32)
     bw_nu = np.ones(N, dtype=np.float32)
     bw_q  = np.ones(N, dtype=np.float32)
-    bold_accum = np.zeros(N, dtype=np.float32)   # mode='legacy': running sum
-                                                  # of instantaneous BOLD within
-                                                  # the current TR window, so the
-                                                  # TR sample is an AVERAGE over
-                                                  # the window, not a 1ms point-
-                                                  # sample (which aliases any
-                                                  # sub-TR ripple into visible
-                                                  # low-frequency "noise").
+    bold_accum = np.zeros(N, dtype=np.float32)  # legacy: TR-window running sum
 
     if mode == 'rshrf':
         HRF_rs  = resample_hrf_for_conv(hrf_compact, N, stock_steps)
@@ -915,15 +922,13 @@ def plot_hrf_shape(sub_str, hrf_compact, TR, out_dir):
 def plot_bold_spectrum(sub_str, emp_bold, bold_leg, bold_hrf, TR, out_dir):
     """
     Global-signal relative power spectrum: Empirical, Legacy, and
-    rsHRF, all overlaid on ONE shared axes (per Daniele's direct
-    feedback: he wants all three in the same figure, no shaded fill,
-    all normalized, so they can be directly compared).
+    rsHRF, all overlaid on ONE shared axes (no shaded fill, all
+    normalized, so they can be directly compared).
 
     Each region's Welch PSD is computed, averaged across ALL regions
     (a "global signal" spectrum, not just Region 0), then normalized by
     its own total power so it becomes RELATIVE power (sums to 1) —
-    per Daniele's earlier review: relative power is what's comparable,
-    not absolute.
+    relative power is what's comparable, not absolute.
     """
     def _avg_relative_psd(X):
         """X: (n_regions, T). Welch PSD per region, averaged across all
@@ -1181,11 +1186,11 @@ def summarize_subjects(dataset, subjects=None):
     print(f"  {len(subs_v)}/{len(subjects)} subject(s) included. Summary plots saved to: {out_dir}")
 
 def run_fc_sweep(dataset, sub_str, G_values=None):
-    """Run the FC sweep for one subject (hand-rolled DMF + BW / rsHRF,
-    no TVB/Subnetwork engine). Computes Pearson r vs empirical FC for
-    every G, selects each method's best-fit G, and saves
-    PCorr_legacy.txt / PCorr_rshrf.txt / G_values.txt / best_fc_*.npy /
-    G_sweep.png / fc_comparison.png to results/<dataset>/<subject>/.
+    """Run the FC sweep for one subject (hand-rolled DMF + BW / rsHRF).
+    Computes Pearson r vs empirical FC for every G, selects each
+    method's best-fit G, and saves PCorr_legacy.txt / PCorr_rshrf.txt /
+    G_values.txt / best_fc_*.npy / G_sweep.png / fc_comparison.png to
+    results/<dataset>/<subject>/.
 
     G_values: list of G's to sweep, or None for the full default
     16-point sweep (or a single-element list for one specific G).
@@ -1345,8 +1350,7 @@ if __name__ == '__main__':
     parser.add_argument('--mode', type=str, nargs='+', choices=['bold', 'fc', 'signal', 'summary'],
                         default=['fc', 'bold', 'signal'],
                         help="Which stage(s) to run, space-separated. "
-                             "'fc': FC sweep + fc_comparison.png (hand-rolled DMF+BW/rsHRF, "
-                             "no TVB/Subnetwork engine). "
+                             "'fc': FC sweep + fc_comparison.png (hand-rolled DMF+BW/rsHRF). "
                              "'bold': simulate BOLD (Legacy+rsHRF) ONLY at each method's "
                              "own best-fit G (read from a completed 'fc' sweep; pass --G "
                              "to override with one explicit G for both methods instead). "

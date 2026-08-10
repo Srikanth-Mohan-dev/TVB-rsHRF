@@ -3,4 +3,4 @@ scipy
 matplotlib
 nitime
 awscli
-rsHRF
+git+https://github.com/bids-apps/rsHRF.git@develop
