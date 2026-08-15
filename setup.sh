@@ -40,7 +40,7 @@ echo "[4/5] Cloning and installing TVB (hybrid-numba branch)"
 if [ ! -d "$TVB_DIR" ]; then
     git clone --branch hybrid-numba https://github.com/the-virtual-brain/tvb-root.git "$TVB_DIR"
 else
-    echo "  $TVB_DIR already exists — skipping clone."
+    echo "  $TVB_DIR already exists - skipping clone."
 fi
 pip install -e "$TVB_DIR/tvb_library"
 

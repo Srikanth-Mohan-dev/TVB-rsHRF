@@ -52,7 +52,7 @@ if not exist "%TVB_DIR%" (
         exit /b 1
     )
 ) else (
-    echo   %TVB_DIR% already exists — skipping clone.
+    echo   %TVB_DIR% already exists - skipping clone.
 )
 pip install -e "%TVB_DIR%\tvb_library"
 if errorlevel 1 (

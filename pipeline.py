@@ -34,14 +34,20 @@ ALL_SUBJECTS = [
 
 S3_BUCKET = "s3://openneuro.org"
 
+# Builds the path to a subject's dataset folder.
+# Joins DATASETS_ROOT with the dataset name and subject ID.
 def dataset_dir(dataset, sub_str):
     return os.path.normpath(
         os.path.join(DATASETS_ROOT, dataset, "sub-" + sub_str, "ses-preop"))
 
+# Builds the path to a subject's results output folder.
+# Joins RESULTS_ROOT with the dataset name and subject ID.
 def results_dir(dataset, sub_str):
     return os.path.normpath(
         os.path.join(RESULTS_ROOT, dataset, sub_str, "outputs", "G_sweep"))
 
+# Checks whether the AWS CLI is installed and callable.
+# Returns True if `aws --version` succeeds, False otherwise.
 def aws_available():
     try:
         subprocess.run(["aws", "--version"], capture_output=True, check=True)
@@ -49,6 +55,8 @@ def aws_available():
     except (FileNotFoundError, subprocess.CalledProcessError):
         return False
 
+# Makes sure a subject's FC.mat and SC.zip files exist locally.
+# Downloads any missing files from S3 via the AWS CLI.
 def ensure_subject_data(dataset, sub_str):
     path = dataset_dir(dataset, sub_str)
     required = ["FC.mat", "SC.zip"]
@@ -79,8 +87,9 @@ def ensure_subject_data(dataset, sub_str):
             )
     return path
 
+# Generates an HRF.mat file from a region-averaged BOLD timeseries.
+# Runs rsHRF in time-series mode and saves the resulting HRF and parameters.
 def generate_hrf_mat(roi_ts, TR, out_path, name="generated", p_jobs=1):
-    """Generate an HRF.mat file via rsHRF from a region BOLD timeseries."""
     from rsHRF import fourD_rsHRF
 
     roi_ts = np.asarray(roi_ts, dtype=float)
@@ -122,8 +131,9 @@ def generate_hrf_mat(roi_ts, TR, out_path, name="generated", p_jobs=1):
     scipy.io.savemat(out_path, {"hrf": hrf, "PARA": PARA})
     return hrf, PARA
 
+# Loads a subject's FC, SC, and HRF data, generating HRF.mat if missing.
+# Returns a dict with everything needed to run the simulation.
 def load_subject_data(dataset, sub_str):
-    """Load FC, SC, HRF for one subject. Returns dict or raises."""
     path = ensure_subject_data(dataset, sub_str)
     print(f"  Loading: {path}")
 
@@ -138,7 +148,7 @@ def load_subject_data(dataset, sub_str):
             tract_lengths = np.loadtxt(f)
 
     if tract_lengths.size == 0 or tract_lengths.ndim < 2:
-        print(f"  WARNING: tract_lengths.txt empty — using uniform 50mm distances")
+        print(f"  WARNING: tract_lengths.txt empty - using uniform 50mm distances")
         tract_lengths = np.where(weights > 0, 50.0, 0.0)
 
     hrf_mat_path = os.path.join(path, "HRF.mat")
@@ -147,7 +157,7 @@ def load_subject_data(dataset, sub_str):
             hrf_mat = scipy.io.loadmat(hrf_mat_path)
             hrf_raw = hrf_mat["hrf"]
         except Exception as e:
-            print(f"  WARNING: existing HRF.mat unreadable ({e}) — regenerating via rsHRF")
+            print(f"  WARNING: existing HRF.mat unreadable ({e}) - regenerating via rsHRF")
             hrf_raw = None
     else:
         hrf_raw = None
@@ -156,7 +166,7 @@ def load_subject_data(dataset, sub_str):
     roi_ts  = mat[roi_key]   # empirical region timeseries, shape (T, N)
 
     if hrf_raw is None:
-        print(f"  HRF.mat missing/invalid for {sub_str} — generating via rsHRF "
+        print(f"  HRF.mat missing/invalid for {sub_str} - generating via rsHRF "
               f"from {roi_key} {roi_ts.shape}")
         hrf_raw, _ = generate_hrf_mat(roi_ts, TR, hrf_mat_path, name=sub_str)
 
@@ -231,9 +241,9 @@ HRF_LEN_S   = 25.0
 model_dt_s  = 0.001
 stock_steps = int(HRF_LEN_S / model_dt_s) + 1
 
+# Resamples each region's HRF to a fixed number of steps for convolution.
+# Reverses each HRF so it can be applied as a dot-product convolution.
 def resample_hrf_for_conv(hrf_compact, N, stock_steps):
-    """Resample each region's HRF from HRF_samples to stock_steps,
-    then reverse for dot-product convolution (exact as C)."""
     HRF_rs = np.zeros((stock_steps, N))
     for r in range(N):
         h = hrf_compact[:, r]
@@ -243,9 +253,9 @@ def resample_hrf_for_conv(hrf_compact, N, stock_steps):
 
 global_v   = 12.5
 
+# Computes the scaled structural connectivity matrix from weights and G.
+# Converts tract lengths to integer conduction delays based on global_v.
 def prepare_sc(weights, tract_lengths, G, global_v=12_500.0):
-    """Compute coupling capacity and delay matrices from SC weights/tract lengths."""
-
     cap = weights * G * J_NMDA
 
     raw_delays = tract_lengths / (global_v * dt)
@@ -253,12 +263,10 @@ def prepare_sc(weights, tract_lengths, G, global_v=12_500.0):
     delays = np.clip(delays, 1, int(raw_delays.max()) + 1)
     return cap, delays
 
-# TVB hybrid-numba engine (Subnetwork/NetworkSet/IntraProjection),
-# shared by both legacy and rshrf — no dynamic FIC for either.
+# Runs the ReducedWongWangExcInh neural mass model via TVB's Simulator API.
+# Returns the raw S_e timeseries (T, N) at 1ms resolution.
 def run_tvb_legacy_simulation(G, weights, tract_lengths, total_dur_ms, N,
                               rand_seed=1403):
-    """Simulate ReducedWongWangExcInh via TVB's hybrid Simulator API.
-    Returns the raw S_e timeseries (T, N) at 1ms resolution."""
     from tvb.simulator.models import ReducedWongWangExcInh
     from tvb.simulator.integrators import HeunStochastic
     import tvb.simulator.noise as tvb_noise
@@ -327,8 +335,9 @@ def run_tvb_legacy_simulation(G, weights, tract_lengths, total_dur_ms, N,
 
     return S_E_timeseries
 
+# Applies the Balloon-Windkessel model to an S_E timeseries to get BOLD.
+# Each TR sample is the average of the BW readout over that TR window.
 def bw_from_timeseries(S_E_timeseries, N, BOLD_TR_ms):
-    """Apply Balloon-Windkessel to a (T,N) S_E trace; TR sample = average over the TR window."""
     total_steps_ms = S_E_timeseries.shape[0]
     BOLD_TS_len    = total_steps_ms // BOLD_TR_ms
 
@@ -375,8 +384,9 @@ def bw_from_timeseries(S_E_timeseries, N, BOLD_TR_ms):
 
     return BOLD_out
 
+# Applies rsHRF convolution to an S_E timeseries to derive BOLD.
+# Convolves each region's resampled HRF with a sliding window of S_E.
 def rshrf_bold_from_timeseries(S_E_timeseries, N, BOLD_TR_ms, hrf_compact):
-    """Apply rsHRF convolution to a (T,N) S_e trace to derive BOLD."""
     total_steps_ms = S_E_timeseries.shape[0]
     BOLD_TS_len    = total_steps_ms // BOLD_TR_ms
 
@@ -395,12 +405,13 @@ def rshrf_bold_from_timeseries(S_E_timeseries, N, BOLD_TR_ms, hrf_compact):
 
     return BOLD_out
 
+# Unused: hand-rolled DMF + BW/rsHRF simulation, kept for reference only.
+# Runs the DMF neural mass model and generates BOLD via legacy or rsHRF mode.
 def run_simulation(G, weights, tract_lengths, hrf_compact,
                    total_dur_ms, BOLD_TR_ms, N,
                    J_NMDA=0.150, w_plus=1.400, tmpJi=1.000,
                    sigma=0.0100, rand_seed=1403,
                    mode='rshrf'):
-    """Hand-rolled DMF + BW/rsHRF simulation (unused — dead code, kept for reference)."""
     np.random.seed(rand_seed)
 
     BOLD_TS_len    = total_dur_ms // BOLD_TR_ms
@@ -581,8 +592,9 @@ def run_simulation(G, weights, tract_lengths, hrf_compact,
 
 DISCARD_TRS = 20
 
+# Computes the functional connectivity matrix from simulated BOLD.
+# Returns the Pearson correlation against the empirical FC matrix.
 def get_fc_correlation(bold, emp_fc, TR, N, discard=0, mode='both'):
-
     uidx    = np.triu_indices(N, 1)
     em_z    = np.arctanh(np.clip(emp_fc[uidx], -0.9999, 0.9999))
     T       = TimeSeries(bold, sampling_interval=TR)
@@ -592,16 +604,17 @@ def get_fc_correlation(bold, emp_fc, TR, N, discard=0, mode='both'):
     r, _    = stats.pearsonr(sim_z, em_z)
     return r, sim_fc
 
+# Computes the mean off-diagonal value of a simulated FC matrix.
+# Used alongside PCorr to flag low-magnitude, washed-out FC results.
 def fc_strength(sim_fc, N):
-    """Mean off-diagonal value of a simulated FC matrix — tracks magnitude separately from PCorr."""
     if sim_fc is None:
         return float('nan')
     uidx = np.triu_indices(N, 1)
     return float(np.mean(sim_fc[uidx]))
 
+# Worker that runs the TVB engine once per G and derives legacy + rsHRF BOLD.
+# Returns the correlation and FC strength results for both methods.
 def run_one_G(args):
-    """Worker: runs the Subnetwork TVB engine once per G, derives Legacy (BW)
-    and rsHRF (convolution) BOLD from that trace, returns r/FC/strength for both."""
     (G, weights, tract_lengths, hrf_compact,
      total_dur_ms, BOLD_TR_ms, N, emp_fc, TR) = args
     try:
@@ -624,13 +637,13 @@ def run_one_G(args):
         print(f"  G={G:.2f} FAILED: {e}", flush=True)
         return G, float('nan'), None, float('nan'), float('nan'), None, float('nan')
 
+# Minimum acceptable mean off-diagonal simulated-FC value.
 FC_STRENGTH_MIN = 0.15
-"""Minimum acceptable mean off-diagonal simulated-FC value used by select_best_G."""
 
+# Selects the best-fit G value from a sweep of correlation results.
+# Picks the smallest G within tolerance of the max r (and FC strength).
 def select_best_G(G_values_sorted, r_values, tol=1e-3, strength_values=None,
                   min_strength=FC_STRENGTH_MIN):
-    """Return (best_G, best_r, best_idx): the smallest G within `tol` of the
-    curve's max r, optionally requiring strength_values >= min_strength."""
     idx_valid = [i for i, r in enumerate(r_values) if r == r and r is not None]
     if not idx_valid:
         return None, float('nan'), None
@@ -662,12 +675,14 @@ def select_best_G(G_values_sorted, r_values, tol=1e-3, strength_values=None,
 # 250 TRs simulated, first 50 discarded -> 200 TRs kept.
 BOLD_ONLY_DISCARD_TRS = 50
 
+# Returns the default 16-point list of G values used for the sweep.
+# Values are sorted in descending order.
 def default_G_values():
-    """Standard 16-point G sweep."""
     return sorted([(i / 10) + 0.01 for i in range(0, 31, 2)], reverse=True)
 
+# Reads a completed fc-sweep's saved files for one subject.
+# Returns the best-fit G for both the legacy and rsHRF methods.
 def get_best_G_from_fc(dataset, sub_str, G_TOL=0.015):
-    """Read PCorr files from a completed 'fc' sweep and return (best_G_leg, best_G_hrf)."""
     out_dir  = results_dir(dataset, sub_str)
     g_path   = os.path.join(out_dir, "G_values.txt")
     leg_path = os.path.join(out_dir, "PCorr_legacy.txt")
@@ -696,8 +711,9 @@ def get_best_G_from_fc(dataset, sub_str, G_TOL=0.015):
     best_G_hrf, _, _ = select_best_G(G_asc, r_hrf_asc, tol=G_TOL, strength_values=strength_hrf_asc)
     return best_G_leg, best_G_hrf
 
+# Reads a completed fc-sweep's saved files for one subject.
+# Returns rsHRF's single best-fit G value, or None if not available.
 def get_max_rshrf_G(dataset, sub_str, G_TOL=0.015):
-    """Read PCorr_rshrf.txt from a completed 'fc' sweep and return rsHRF's best-fit G."""
     out_dir  = results_dir(dataset, sub_str)
     g_path   = os.path.join(out_dir, "G_values.txt")
     hrf_path = os.path.join(out_dir, "PCorr_rshrf.txt")
@@ -713,30 +729,36 @@ def get_max_rshrf_G(dataset, sub_str, G_TOL=0.015):
     best_G, _, _ = select_best_G(G_asc, p_asc, tol=G_TOL)
     return best_G
 
+# Builds the file paths used to cache simulated BOLD for one G value.
+# Returns separate paths for the legacy and rsHRF BOLD caches.
 def bold_cache_paths(out_dir, G):
-    """Filenames for the per-G BOLD cache."""
     return (os.path.join(out_dir, f"bold_legacy_G{G:.2f}.npy"),
             os.path.join(out_dir, f"bold_rshrf_G{G:.2f}.npy"))
 
+# Loads cached legacy and rsHRF BOLD arrays for one G, if present.
+# Returns (None, None) if no cache is found.
 def load_cached_bold(out_dir, G):
     leg_path, hrf_path = bold_cache_paths(out_dir, G)
     if os.path.exists(leg_path) and os.path.exists(hrf_path):
         return np.load(leg_path), np.load(hrf_path)
     return None, None
 
+# Saves simulated legacy and rsHRF BOLD arrays to disk for one G.
+# Lets later runs reuse the simulation instead of rerunning it.
 def save_bold_cache(out_dir, G, bold_leg, bold_hrf):
     leg_path, hrf_path = bold_cache_paths(out_dir, G)
     np.save(leg_path, bold_leg)
     np.save(hrf_path, bold_hrf)
 
+# Gets simulated BOLD for every G in G_set, reusing cached results.
+# Simulates any missing G's in parallel and caches the new results.
 def simulate_bold_at_Gs(G_set, weights, tract_lengths, hrf_compact, BOLD_TR_ms, N, out_dir):
-    """Get BOLD for every G in G_set, using the on-disk cache when available."""
     results_by_G = {}
     to_simulate = []
     for G in G_set:
         cached_leg, cached_hrf = load_cached_bold(out_dir, G)
         if cached_leg is not None:
-            print(f"  [BOLD] G={G:.2f} found cached — reusing, no resimulation")
+            print(f"  [BOLD] G={G:.2f} found cached - reusing, no resimulation")
             results_by_G[G] = (cached_leg, cached_hrf)
         else:
             to_simulate.append(G)
@@ -754,8 +776,9 @@ def simulate_bold_at_Gs(G_set, weights, tract_lengths, hrf_compact, BOLD_TR_ms, 
 
     return results_by_G
 
+# Worker that simulates BOLD for one G value via the TVB engine.
+# 250 TRs are simulated and the first 50 discarded as burn-in.
 def simulate_bold_one_G(args):
-    """Worker: simulate BOLD for one G via the Subnetwork engine (250 TRs, first 50 discarded)."""
     (G, weights, tract_lengths, hrf_compact, BOLD_TR_ms, N) = args
     bold_dur_ms = int(BOLD_TR_ms * 250)
     try:
@@ -775,13 +798,16 @@ def simulate_bold_one_G(args):
         print(f"  [BOLD] G={G:.2f} FAILED: {e}", flush=True)
         return G, None, None
 
+# Z-scores an array by subtracting its mean and dividing by its std.
+# Returns the centered array unchanged if the std is zero.
 def _zscore(x):
     x = np.asarray(x, dtype=float)
     sd = x.std()
     return (x - x.mean()) / sd if sd > 0 else x - x.mean()
 
+# Plots Region 0 BOLD for empirical, legacy, and rsHRF as stacked subplots.
+# Saves the figure as bold_region0_comparison.png.
 def plot_bold_region0_comparison(sub_str, emp_bold, bold_leg, bold_hrf, out_dir):
-    """Region 0, z-scored: Empirical/Legacy/rsHRF stacked, all truncated to a common length."""
     emp_region0 = np.asarray(emp_bold)[:, 0] if emp_bold is not None else None
     leg_region0 = bold_leg[0]
     hrf_region0 = bold_hrf[0]
@@ -790,7 +816,7 @@ def plot_bold_region0_comparison(sub_str, emp_bold, bold_leg, bold_hrf, out_dir)
     T_common = min(lengths)
     if emp_region0 is not None and len(emp_region0) != T_common:
         print(f"  NOTE: empirical BOLD has {len(emp_region0)} TRs vs "
-              f"{len(leg_region0)} simulated — truncating all traces to "
+              f"{len(leg_region0)} simulated - truncating all traces to "
               f"{T_common} TRs for bold_region0_comparison.png")
 
     fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
@@ -809,28 +835,30 @@ def plot_bold_region0_comparison(sub_str, emp_bold, bold_leg, bold_hrf, out_dir)
         ax.set_ylabel("z-score")
         ax.grid(True, alpha=0.3)
     axes[-1].set_xlabel("Timepoint (TR)")
-    plt.suptitle(f"{sub_str} — Region 0 BOLD (z-scored)", fontsize=14)
+    plt.suptitle(f"{sub_str} - Region 0 BOLD (z-scored)", fontsize=14)
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "bold_region0_comparison.png"), dpi=150)
     plt.close()
     print(f"  Saved: {os.path.join(out_dir, 'bold_region0_comparison.png')}")
 
+# Plots rsHRF BOLD for regions 1-5 on one combined figure.
+# Saves the figure as bold_regions1to5_transient_removed.png.
 def plot_bold_regions1to5(sub_str, bold_hrf, TR, out_dir):
-    """Regions 1-5, rsHRF, one combined figure."""
     fig, ax = plt.subplots(figsize=(12, 5))
     for r in range(1, 6):
         ax.plot(bold_hrf[r], label=f"Region {r}")
     ax.set_xlabel(f"Timepoints (TR={TR}s)")
     ax.set_ylabel("BOLD signal")
-    ax.set_title(f"Simulated BOLD — {sub_str} rsHRF (canon2dd) — transient removed")
+    ax.set_title(f"Simulated BOLD - {sub_str} rsHRF (canon2dd) - transient removed")
     ax.legend()
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "bold_regions1to5_transient_removed.png"), dpi=150)
     plt.close()
     print(f"  Saved: {os.path.join(out_dir, 'bold_regions1to5_transient_removed.png')}")
 
+# Simulates BOLD at each method's best-fit G and generates comparison plots.
+# Loads subject data, resolves G values, and saves the resulting figures.
 def run_bold_sweep(dataset, sub_str, G_values=None):
-    """Simulate BOLD at each method's best-fit G (or --G override), save 2 comparison plots."""
     print("\n" + "=" * 60)
     print(f"BOLD  DATASET: {dataset}  SUBJECT: {sub_str}")
     print("=" * 60)
@@ -857,7 +885,7 @@ def run_bold_sweep(dataset, sub_str, G_values=None):
     else:
         best_G_leg, best_G_hrf = get_best_G_from_fc(dataset, sub_str)
         if best_G_leg is None or best_G_hrf is None:
-            print(f"  No completed 'fc' sweep found for {sub_str} — run "
+            print(f"  No completed 'fc' sweep found for {sub_str} - run "
                   f"--mode fc first (so best-fit G is known), or pass "
                   f"--G explicitly to override.")
             return
@@ -871,7 +899,7 @@ def run_bold_sweep(dataset, sub_str, G_values=None):
     bold_hrf_at_best = results_by_G[best_G_hrf][1]
 
     if bold_leg_at_best is None or bold_hrf_at_best is None:
-        print("  BOLD simulation failed — no plots produced.")
+        print("  BOLD simulation failed - no plots produced.")
         return
 
     plot_bold_region0_comparison(sub_str, emp_bold, bold_leg_at_best, bold_hrf_at_best, out_dir)
@@ -879,8 +907,9 @@ def run_bold_sweep(dataset, sub_str, G_values=None):
 
     print(f"  Saved 2 BOLD plots to: {out_dir}")
 
+# Plots the canonical HRF shape used for Region 0's rsHRF convolution.
+# Saves the figure as hrf_shape_region0.png.
 def plot_hrf_shape(sub_str, hrf_compact, TR, out_dir):
-    """Plot the canonical HRF shape used for rsHRF convolution, Region 0."""
     hrf_region0 = hrf_compact[:, 0]
     t = np.arange(len(hrf_region0)) * TR
 
@@ -889,15 +918,18 @@ def plot_hrf_shape(sub_str, hrf_compact, TR, out_dir):
     ax.axhline(0, color='k', linewidth=0.5)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("HRF amplitude (normalized)")
-    ax.set_title(f"{sub_str} — HRF shape (Region 0, canon2dd)")
+    ax.set_title(f"{sub_str} - HRF shape (Region 0, canon2dd)")
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "hrf_shape_region0.png"), dpi=150)
     plt.close()
     print(f"  Saved: {os.path.join(out_dir, 'hrf_shape_region0.png')}")
 
+# Plots the relative power spectrum of empirical, legacy, and rsHRF BOLD.
+# Averages the spectrum across all regions and saves the figure.
 def plot_bold_spectrum(sub_str, emp_bold, bold_leg, bold_hrf, TR, out_dir):
-    """Global-signal relative power spectrum: Empirical, Legacy, rsHRF, one shared plot."""
+    # Computes the Welch power spectrum for each region and averages them.
+    # Normalizes the result to relative power that sums to 1.
     def _avg_relative_psd(X):
         X = np.asarray(X, dtype=float)
         nperseg = min(X.shape[1], 64)
@@ -928,7 +960,7 @@ def plot_bold_spectrum(sub_str, emp_bold, bold_leg, bold_hrf, TR, out_dir):
     ax.set_xticks(np.arange(0, 0.4, 0.1))
     ax.set_xlabel("Frequency (Hz)")
     ax.set_ylabel("Relative power")
-    ax.set_title(f"{sub_str} — Global-signal relative power spectrum "
+    ax.set_title(f"{sub_str} - Global-signal relative power spectrum "
                 f"(averaged across all regions)")
     ax.legend(); ax.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -936,8 +968,9 @@ def plot_bold_spectrum(sub_str, emp_bold, bold_leg, bold_hrf, TR, out_dir):
     plt.close()
     print(f"  Saved: {os.path.join(out_dir, 'bold_spectrum_global.png')}")
 
+# Runs the signal-analysis mode: HRF shape plot and BOLD power spectrum.
+# Resolves G automatically from a completed fc sweep if not given.
 def run_signal_analysis(dataset, sub_str, G=None):
-    """HRF shape + global-signal spectrum, at rsHRF's best-fit G (or --G); runs 'fc' first if needed."""
     print("\n" + "=" * 60)
     print(f"SIGNAL  DATASET: {dataset}  SUBJECT: {sub_str}")
     print("=" * 60)
@@ -966,13 +999,13 @@ def run_signal_analysis(dataset, sub_str, G=None):
     else:
         chosen_G = get_max_rshrf_G(dataset, sub_str)
         if chosen_G is None:
-            print(f"  No completed 'fc' sweep found for {sub_str} — running "
+            print(f"  No completed 'fc' sweep found for {sub_str} - running "
                   f"'fc' now so rsHRF's best-fit G can be resolved...")
             run_fc_sweep(dataset, sub_str)
             chosen_G = get_max_rshrf_G(dataset, sub_str)
             if chosen_G is None:
                 print(f"  'fc' sweep did not produce usable PCorr results for "
-                      f"{sub_str} — cannot resolve G. Pass --G explicitly to "
+                      f"{sub_str} - cannot resolve G. Pass --G explicitly to "
                       f"override.")
                 return
 
@@ -983,18 +1016,21 @@ def run_signal_analysis(dataset, sub_str, G=None):
     bold_hrf_at_chosen = results_by_G[chosen_G][1]
 
     if bold_leg_at_chosen is None or bold_hrf_at_chosen is None:
-        print("  BOLD simulation failed — spectrum plot skipped.")
+        print("  BOLD simulation failed - spectrum plot skipped.")
         return
 
     plot_bold_spectrum(sub_str, emp_bold, bold_leg_at_chosen, bold_hrf_at_chosen, TR, out_dir)
     print(f"  Signal analysis plots saved to: {out_dir}")
 
 
+# Builds the path to a dataset's summary output folder.
+# Joins RESULTS_ROOT with the dataset name and "summary".
 def summary_dir(dataset):
     return os.path.normpath(os.path.join(RESULTS_ROOT, dataset, "summary"))
 
+# Aggregates each subject's best-fit PCorr results across a dataset.
+# Saves a paired scatter plot and a per-subject line comparison plot.
 def summarize_subjects(dataset, subjects=None):
-    """Aggregate PCorr files across subjects into 2 summary plots (paired scatter, PCorr differences)."""
     if subjects is None:
         subjects = ALL_SUBJECTS
 
@@ -1045,7 +1081,7 @@ def summarize_subjects(dataset, subjects=None):
     is_con  = np.array([s.upper().startswith('CON') for s in subs_v])
 
     if len(subs_v) == 0:
-        print(f"  All {len(subs)} subject(s) found had NaN best-fit r — nothing to plot")
+        print(f"  All {len(subs)} subject(s) found had NaN best-fit r - nothing to plot")
         return
 
     out_dir = summary_dir(dataset)
@@ -1071,8 +1107,8 @@ def summarize_subjects(dataset, subjects=None):
         for rli, rhi in zip(rl, rh):
             axg.plot([rli, rli], [rli, rhi], color=color, linewidth=1, alpha=0.5, zorder=1)
         axg.scatter(rl, rh, color=color, s=70, edgecolor='none', zorder=2)
-        axg.set_xlabel("Legacy (BW) — Pearson r")
-        axg.set_ylabel("rsHRF (canon2dd) — Pearson r")
+        axg.set_xlabel("Legacy (BW) - Pearson r")
+        axg.set_ylabel("rsHRF (canon2dd) - Pearson r")
         axg.set_title(subtitle)
         axg.set_xlim(lo, hi); axg.set_ylim(lo, hi)
         axg.legend(); axg.grid(True, alpha=0.3)
@@ -1092,7 +1128,7 @@ def summarize_subjects(dataset, subjects=None):
 
     ax2.set_xticks(x); ax2.set_xticklabels(subs_v, rotation=45, ha='right')
     ax2.set_ylabel("Best-fit Pearson r (PCorr)")
-    ax2.set_title(f"PCorr at best fit — Legacy vs rsHRF — {dataset}")
+    ax2.set_title(f"PCorr at best fit - Legacy vs rsHRF - {dataset}")
     ax2.legend()
     ax2.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -1102,8 +1138,9 @@ def summarize_subjects(dataset, subjects=None):
 
     print(f"  {len(subs_v)}/{len(subjects)} subject(s) included. Summary plots saved to: {out_dir}")
 
+# Runs the full G sweep (legacy + rsHRF) via the TVB engine and computes FC correlations.
+# Selects each method's best-fit G and saves the results, plots, and files.
 def run_fc_sweep(dataset, sub_str, G_values=None):
-    """Run the FC sweep (Subnetwork TVB engine) for one subject, save PCorr/FC/plots."""
     print("\n" + "=" * 60)
     print(f"DATASET: {dataset}  SUBJECT: {sub_str}")
     print("=" * 60)
@@ -1114,7 +1151,7 @@ def run_fc_sweep(dataset, sub_str, G_values=None):
     default_sweep = G_values is None
     done_file = os.path.join(out_dir, "PCorr_legacy.txt")
     if default_sweep and os.path.exists(done_file):
-        print(f"  Already done — skipping. (delete {done_file} to re-run)")
+        print(f"  Already done - skipping. (delete {done_file} to re-run)")
         return
 
     try:
@@ -1203,7 +1240,7 @@ def run_fc_sweep(dataset, sub_str, G_values=None):
     if best_fc_hrf is not None:
         np.save(os.path.join(out_dir, "best_fc_rshrf.npy"),  best_fc_hrf)
 
-    print(f"\n  RESULTS — {sub_str}")
+    print(f"\n  RESULTS - {sub_str}")
     print(f"    Best Legacy : r={best_r_leg:.4f}  G={best_G_leg}  r_vs_SC={r_leg_sc:.3f}")
     print(f"    Best rsHRF  : r={best_r_hrf:.4f}  G={best_G_hrf}  r_vs_SC={r_hrf_sc:.3f}")
     for G, rl, rr in zip(G_values, PCorr_legacy, PCorr_rshrf):
@@ -1213,7 +1250,7 @@ def run_fc_sweep(dataset, sub_str, G_values=None):
     ax.plot(G_values, PCorr_legacy, 'b-o', label='Legacy (BW)',     markersize=6)
     ax.plot(G_values, PCorr_rshrf,  'r-o', label='rsHRF (canon2dd)',markersize=6)
     ax.set_xlabel("Global Coupling G"); ax.set_ylabel("Pearson r")
-    ax.set_title(f"G Sweep — {sub_str}")
+    ax.set_title(f"G Sweep - {sub_str}")
     ax.legend(); ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "G_sweep.png"), dpi=150)
@@ -1233,7 +1270,7 @@ def run_fc_sweep(dataset, sub_str, G_values=None):
         axes[3].set_title(f"rsHRF (canon2dd)\nr={best_r_hrf:.3f} vs empirical  "
                           f"r={r_hrf_sc:.3f} vs SC\nG={best_G_hrf:.2f}")
         plt.colorbar(im3, ax=axes[3])
-        plt.suptitle(f"{sub_str} — FC Comparison", fontsize=13)
+        plt.suptitle(f"{sub_str} - FC Comparison", fontsize=13)
         plt.tight_layout()
         plt.savefig(os.path.join(out_dir, "fc_comparison.png"), dpi=150)
         plt.close()
