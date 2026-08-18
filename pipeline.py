@@ -33,20 +33,14 @@ ALL_SUBJECTS = [
 
 S3_BUCKET = "s3://openneuro.org"
 
-# Builds the path to a subject's dataset folder.
-# Joins DATASETS_ROOT with the dataset name and subject ID.
 def dataset_dir(dataset, sub_str):
     return os.path.normpath(
         os.path.join(DATASETS_ROOT, dataset, "sub-" + sub_str, "ses-preop"))
 
-# Builds the path to a subject's results output folder.
-# Joins RESULTS_ROOT with the dataset name and subject ID.
 def results_dir(dataset, sub_str):
     return os.path.normpath(
         os.path.join(RESULTS_ROOT, dataset, sub_str, "outputs", "G_sweep"))
 
-# Checks whether the AWS CLI is installed and callable.
-# Returns True if `aws --version` succeeds, False otherwise.
 def aws_available():
     try:
         subprocess.run(["aws", "--version"], capture_output=True, check=True)
@@ -54,8 +48,6 @@ def aws_available():
     except (FileNotFoundError, subprocess.CalledProcessError):
         return False
 
-# Makes sure a subject's FC.mat and SC.zip files exist locally.
-# Downloads any missing files from S3 via the AWS CLI.
 def ensure_subject_data(dataset, sub_str):
     path = dataset_dir(dataset, sub_str)
     required = ["FC.mat", "SC.zip"]
@@ -86,8 +78,6 @@ def ensure_subject_data(dataset, sub_str):
             )
     return path
 
-# Generates an HRF.mat file from a region-averaged BOLD timeseries.
-# Runs rsHRF in time-series mode and saves the resulting HRF and parameters.
 def generate_hrf_mat(roi_ts, TR, out_path, name="generated", p_jobs=1):
     from rsHRF import fourD_rsHRF
 
@@ -140,8 +130,6 @@ def generate_hrf_mat(roi_ts, TR, out_path, name="generated", p_jobs=1):
     scipy.io.savemat(out_path, {"hrf": hrf, "PARA": PARA})
     return hrf, PARA
 
-# Loads a subject's FC, SC, and HRF data, generating HRF.mat if missing.
-# Returns a dict with everything needed to run the simulation.
 def load_subject_data(dataset, sub_str):
     path = ensure_subject_data(dataset, sub_str)
     print(f"  Loading: {path}")
@@ -172,7 +160,7 @@ def load_subject_data(dataset, sub_str):
         hrf_raw = None
 
     roi_key = next(k for k in mat if k.endswith("ROIts_DK68"))
-    roi_ts  = mat[roi_key]   # empirical region timeseries, shape (T, N)
+    roi_ts  = mat[roi_key]
 
     if hrf_raw is None:
         print(f"  HRF.mat missing/invalid for {sub_str} - generating via rsHRF "
@@ -250,8 +238,6 @@ HRF_LEN_S   = 25.0
 model_dt_s  = 0.001
 stock_steps = int(HRF_LEN_S / model_dt_s) + 1
 
-# Resamples each region's HRF to a fixed number of steps for convolution.
-# Reverses each HRF so it can be applied as a dot-product convolution.
 def resample_hrf_for_conv(hrf_compact, N, stock_steps):
     HRF_rs = np.zeros((stock_steps, N))
     for r in range(N):
@@ -262,8 +248,6 @@ def resample_hrf_for_conv(hrf_compact, N, stock_steps):
 
 global_v   = 12.5
 
-# Computes the scaled structural connectivity matrix from weights and G.
-# Converts tract lengths to integer conduction delays based on global_v.
 def prepare_sc(weights, tract_lengths, G, global_v=12_500.0):
     cap = weights * G * J_NMDA
 
@@ -274,6 +258,9 @@ def prepare_sc(weights, tract_lengths, G, global_v=12_500.0):
 
 # Runs the DMF neural mass model simulation and generates BOLD output.
 # Supports 'legacy' (Balloon-Windkessel) and 'rshrf' (FIC + rsHRF) modes.
+# Returns (BOLD_out, J_i) -- J_i is the full per-region array (not a
+# mean), FIC now runs for both modes so both converge to a genuine,
+# non-trivial per-region J_i, not just rsHRF.
 def run_simulation(G, weights, tract_lengths, hrf_compact,
                    total_dur_ms, BOLD_TR_ms, N,
                    J_NMDA=0.150, w_plus=1.400, tmpJi=1.000,
@@ -303,7 +290,7 @@ def run_simulation(G, weights, tract_lengths, hrf_compact,
     bw_f  = np.ones(N, dtype=np.float32)
     bw_nu = np.ones(N, dtype=np.float32)
     bw_q  = np.ones(N, dtype=np.float32)
-    bold_accum = np.zeros(N, dtype=np.float32)  # legacy: TR-window running sum
+    bold_accum = np.zeros(N, dtype=np.float32)
 
     if mode == 'rshrf':
         HRF_rs  = resample_hrf_for_conv(hrf_compact, N, stock_steps)
@@ -325,7 +312,7 @@ def run_simulation(G, weights, tract_lengths, hrf_compact,
     delay_idx = 0
 
     print(f"  Simulating {total_steps_ms} ms  G={G:.2f}  mode={mode}  "
-          f"FIC={'ON' if mode=='rshrf' else 'OFF'}  "
+          f"FIC=ON  "
           f"max_delay={max_delay}", flush=True)
 
     conn_target = []
@@ -427,19 +414,21 @@ def run_simulation(G, weights, tract_lengths, hrf_compact,
                         + np.float32(k2) * (np.float32(1.0) - bq / bnu)
                         + np.float32(k3) * (np.float32(1.0) - bnu)))
 
-        if mode == 'rshrf':
-            if (ts >= FIC_start_step and ts <= FIC_end_step
-                    and ts % FIC_interval_step == 0 and i_meanfr > 0):
-                mean_FR_E = meanFR     / i_meanfr
-                mean_FR_I = meanFR_INH / i_meanfr
-                print(f"    FIC t={ts}ms  mean_FR={mean_FR_E.mean():.2f}Hz  "
-                      f"J_i={J_i.mean():.4f}", flush=True)
+        # FIC now runs for BOTH modes -- Legacy dynamically tunes J_i
+        # exactly the same way rsHRF does (previously gated to
+        # mode=='rshrf' only).
+        if (ts >= FIC_start_step and ts <= FIC_end_step
+                and ts % FIC_interval_step == 0 and i_meanfr > 0):
+            mean_FR_E = meanFR     / i_meanfr
+            mean_FR_I = meanFR_INH / i_meanfr
+            print(f"    FIC t={ts}ms  mean_FR={mean_FR_E.mean():.2f}Hz  "
+                  f"J_i={J_i.mean():.4f}", flush=True)
 
-                J_i += isp_eta * (mean_FR_I * mean_FR_E - target_FR * mean_FR_I)
-                J_i  = np.clip(J_i, 0.0001, None)
-                meanFR[:]     = 0.0
-                meanFR_INH[:] = 0.0
-                i_meanfr      = 0
+            J_i += isp_eta * (mean_FR_I * mean_FR_E - target_FR * mean_FR_I)
+            J_i  = np.clip(J_i, 0.0001, None)
+            meanFR[:]     = 0.0
+            meanFR_INH[:] = 0.0
+            i_meanfr      = 0
 
         if mode == 'rshrf':
             sig_buf[sig_idx, :] = S_E
@@ -455,12 +444,10 @@ def run_simulation(G, weights, tract_lengths, hrf_compact,
             bold_t += 1
 
     print(f"    Done.  BOLD shape: {BOLD_out.shape}", flush=True)
-    return BOLD_out
+    return BOLD_out, J_i.copy()
 
 DISCARD_TRS = 20
 
-# Computes the functional connectivity matrix from simulated BOLD.
-# Returns the Pearson correlation against the empirical FC matrix.
 def get_fc_correlation(bold, emp_fc, TR, N, discard=0, mode='both'):
     uidx    = np.triu_indices(N, 1)
     em_z    = np.arctanh(np.clip(emp_fc[uidx], -0.9999, 0.9999))
@@ -471,8 +458,6 @@ def get_fc_correlation(bold, emp_fc, TR, N, discard=0, mode='both'):
     r, _    = stats.pearsonr(sim_z, em_z)
     return r, sim_fc
 
-# Computes the mean off-diagonal value of a simulated FC matrix.
-# Used alongside PCorr to flag low-magnitude, washed-out FC results.
 def fc_strength(sim_fc, N):
     if sim_fc is None:
         return float('nan')
@@ -480,35 +465,35 @@ def fc_strength(sim_fc, N):
     return float(np.mean(sim_fc[uidx]))
 
 # Worker that runs both legacy and rsHRF simulations for one G value.
-# Returns the correlation and FC strength results for both methods.
+# Returns the correlation, FC strength, AND full per-region J_i array
+# for both methods.
 def run_one_G(args):
     (G, weights, tract_lengths, hrf_compact,
      total_dur_ms, BOLD_TR_ms, N, emp_fc, TR) = args
     try:
-        bold_leg = run_simulation(
+        bold_leg, ji_leg_arr = run_simulation(
             G, weights, tract_lengths, hrf_compact,
             total_dur_ms, BOLD_TR_ms, N, mode='legacy')
         r_leg, sim_fc_leg = get_fc_correlation(bold_leg, emp_fc, TR, N)
         strength_leg = fc_strength(sim_fc_leg, N)
 
-        bold_hrf = run_simulation(
+        bold_hrf, ji_hrf_arr = run_simulation(
             G, weights, tract_lengths, hrf_compact,
             total_dur_ms, BOLD_TR_ms, N, mode='rshrf')
         r_hrf, sim_fc_hrf = get_fc_correlation(bold_hrf, emp_fc, TR, N)
         strength_hrf = fc_strength(sim_fc_hrf, N)
 
-        print(f"  G={G:.2f}  Legacy r={r_leg:.4f} (strength={strength_leg:.3f})  "
-              f"rsHRF r={r_hrf:.4f} (strength={strength_hrf:.3f})", flush=True)
-        return G, r_leg, sim_fc_leg, strength_leg, r_hrf, sim_fc_hrf, strength_hrf
+        print(f"  G={G:.2f}  Legacy r={r_leg:.4f} (strength={strength_leg:.3f}, "
+              f"Ji_mean={ji_leg_arr.mean():.4f})  "
+              f"rsHRF r={r_hrf:.4f} (strength={strength_hrf:.3f}, "
+              f"Ji_mean={ji_hrf_arr.mean():.4f})", flush=True)
+        return G, r_leg, sim_fc_leg, strength_leg, ji_leg_arr, r_hrf, sim_fc_hrf, strength_hrf, ji_hrf_arr
     except Exception as e:
         print(f"  G={G:.2f} FAILED: {e}", flush=True)
-        return G, float('nan'), None, float('nan'), float('nan'), None, float('nan')
+        return G, float('nan'), None, float('nan'), None, float('nan'), None, float('nan'), None
 
-# Minimum acceptable mean off-diagonal simulated-FC value.
 FC_STRENGTH_MIN = 0.15
 
-# Selects the best-fit G value from a sweep of correlation results.
-# Picks the smallest G within tolerance of the max r (and FC strength).
 def select_best_G(G_values_sorted, r_values, tol=1e-3, strength_values=None,
                   min_strength=FC_STRENGTH_MIN):
     idx_valid = [i for i, r in enumerate(r_values) if r == r and r is not None]
@@ -520,18 +505,15 @@ def select_best_G(G_values_sorted, r_values, tol=1e-3, strength_values=None,
 
     if strength_values is not None:
         meets_strength = [i for i in within_tol
-                          if strength_values[i] == strength_values[i]  # not NaN
+                          if strength_values[i] == strength_values[i]
                           and strength_values[i] >= min_strength]
         if meets_strength:
-            i = meets_strength[0]   # smallest G (within_tol preserves ascending order)
+            i = meets_strength[0]
             return G_values_sorted[i], r_values[i], i
-        # No within-tol candidate clears the strength bar -> pick the
-        # least pale (highest strength) one instead of a guaranteed-pale result.
         scored = [i for i in within_tol if strength_values[i] == strength_values[i]]
         if scored:
             i = max(scored, key=lambda i: strength_values[i])
             return G_values_sorted[i], r_values[i], i
-        # strength data unusable (all NaN) -> fall through to r-only rule below
 
     for i in within_tol:
         return G_values_sorted[i], r_values[i], i
@@ -539,17 +521,11 @@ def select_best_G(G_values_sorted, r_values, tol=1e-3, strength_values=None,
     best_idx = max(idx_valid, key=lambda i: r_values[i])
     return G_values_sorted[best_idx], r_values[best_idx], best_idx
 
-# BOLD-only convention: simulate 250 TRs, discard the first 50 -> 200
-# TRs of settled BOLD saved to disk.
 BOLD_ONLY_DISCARD_TRS = 50
 
-# Returns the default 16-point list of G values used for the sweep.
-# Values are sorted in descending order.
 def default_G_values():
     return sorted([(i / 10) + 0.01 for i in range(0, 31, 2)], reverse=True)
 
-# Reads a completed fc-sweep's saved files for one subject.
-# Returns the best-fit G for both the legacy and rsHRF methods.
 def get_best_G_from_fc(dataset, sub_str, G_TOL=0.015):
     out_dir  = results_dir(dataset, sub_str)
     g_path   = os.path.join(out_dir, "G_values.txt")
@@ -579,8 +555,6 @@ def get_best_G_from_fc(dataset, sub_str, G_TOL=0.015):
     best_G_hrf, _, _ = select_best_G(G_asc, r_hrf_asc, tol=G_TOL, strength_values=strength_hrf_asc)
     return best_G_leg, best_G_hrf
 
-# Reads a completed fc-sweep's saved files for one subject.
-# Returns rsHRF's single best-fit G value, or None if not available.
 def get_max_rshrf_G(dataset, sub_str, G_TOL=0.015):
     out_dir  = results_dir(dataset, sub_str)
     g_path   = os.path.join(out_dir, "G_values.txt")
@@ -597,29 +571,21 @@ def get_max_rshrf_G(dataset, sub_str, G_TOL=0.015):
     best_G, _, _ = select_best_G(G_asc, p_asc, tol=G_TOL)
     return best_G
 
-# Builds the file paths used to cache simulated BOLD for one G value.
-# Returns separate paths for the legacy and rsHRF BOLD caches.
 def bold_cache_paths(out_dir, G):
     return (os.path.join(out_dir, f"bold_legacy_G{G:.2f}.npy"),
             os.path.join(out_dir, f"bold_rshrf_G{G:.2f}.npy"))
 
-# Loads cached legacy and rsHRF BOLD arrays for one G, if present.
-# Returns (None, None) if no cache is found.
 def load_cached_bold(out_dir, G):
     leg_path, hrf_path = bold_cache_paths(out_dir, G)
     if os.path.exists(leg_path) and os.path.exists(hrf_path):
         return np.load(leg_path), np.load(hrf_path)
     return None, None
 
-# Saves simulated legacy and rsHRF BOLD arrays to disk for one G.
-# Lets later runs reuse the simulation instead of rerunning it.
 def save_bold_cache(out_dir, G, bold_leg, bold_hrf):
     leg_path, hrf_path = bold_cache_paths(out_dir, G)
     np.save(leg_path, bold_leg)
     np.save(hrf_path, bold_hrf)
 
-# Gets simulated BOLD for every G in G_set, reusing cached results.
-# Simulates any missing G's in parallel and caches the new results.
 def simulate_bold_at_Gs(G_set, weights, tract_lengths, hrf_compact, BOLD_TR_ms, N, out_dir):
     results_by_G = {}
     to_simulate = []
@@ -644,19 +610,17 @@ def simulate_bold_at_Gs(G_set, weights, tract_lengths, hrf_compact, BOLD_TR_ms, 
 
     return results_by_G
 
-# Worker that simulates BOLD (legacy + rsHRF) for one G value.
-# 250 TRs are simulated and the first 50 discarded as burn-in.
 def simulate_bold_one_G(args):
     (G, weights, tract_lengths, hrf_compact, BOLD_TR_ms, N) = args
     bold_dur_ms = int(BOLD_TR_ms * 250)
     try:
-        bold_leg_full = run_simulation(
+        bold_leg_full, _ = run_simulation(
             G, weights, tract_lengths, hrf_compact,
             bold_dur_ms, BOLD_TR_ms, N, mode='legacy')
         bold_leg = bold_leg_full[:, BOLD_ONLY_DISCARD_TRS:]
         del bold_leg_full
 
-        bold_hrf_full = run_simulation(
+        bold_hrf_full, _ = run_simulation(
             G, weights, tract_lengths, hrf_compact,
             bold_dur_ms, BOLD_TR_ms, N, mode='rshrf')
         bold_hrf = bold_hrf_full[:, BOLD_ONLY_DISCARD_TRS:]
@@ -668,15 +632,11 @@ def simulate_bold_one_G(args):
         print(f"  [BOLD] G={G:.2f} FAILED: {e}", flush=True)
         return G, None, None
 
-# Z-scores an array by subtracting its mean and dividing by its std.
-# Returns the centered array unchanged if the std is zero.
 def _zscore(x):
     x = np.asarray(x, dtype=float)
     sd = x.std()
     return (x - x.mean()) / sd if sd > 0 else x - x.mean()
 
-# Plots Region 0 BOLD for empirical, legacy, and rsHRF as stacked subplots.
-# Saves the figure as bold_region0_comparison.png.
 def plot_bold_region0_comparison(sub_str, emp_bold, bold_leg, bold_hrf, out_dir):
     emp_region0 = np.asarray(emp_bold)[:, 0] if emp_bold is not None else None
     leg_region0 = bold_leg[0]
@@ -711,8 +671,6 @@ def plot_bold_region0_comparison(sub_str, emp_bold, bold_leg, bold_hrf, out_dir)
     plt.close()
     print(f"  Saved: {os.path.join(out_dir, 'bold_region0_comparison.png')}")
 
-# Plots rsHRF BOLD for regions 1-5 on one combined figure.
-# Saves the figure as bold_regions1to5_transient_removed.png.
 def plot_bold_regions1to5(sub_str, bold_hrf, TR, out_dir):
     fig, ax = plt.subplots(figsize=(12, 5))
     for r in range(1, 6):
@@ -726,8 +684,6 @@ def plot_bold_regions1to5(sub_str, bold_hrf, TR, out_dir):
     plt.close()
     print(f"  Saved: {os.path.join(out_dir, 'bold_regions1to5_transient_removed.png')}")
 
-# Simulates BOLD at each method's best-fit G and generates comparison plots.
-# Loads subject data, resolves G values, and saves the resulting figures.
 def run_bold_sweep(dataset, sub_str, G_values=None):
     print("\n" + "=" * 60)
     print(f"BOLD  DATASET: {dataset}  SUBJECT: {sub_str}")
@@ -777,8 +733,6 @@ def run_bold_sweep(dataset, sub_str, G_values=None):
 
     print(f"  Saved 2 BOLD plots to: {out_dir}")
 
-# Plots the canonical HRF shape used for Region 0's rsHRF convolution.
-# Saves the figure as hrf_shape_region0.png.
 def plot_hrf_shape(sub_str, hrf_compact, TR, out_dir):
     hrf_region0 = hrf_compact[:, 0]
     t = np.arange(len(hrf_region0)) * TR
@@ -795,11 +749,7 @@ def plot_hrf_shape(sub_str, hrf_compact, TR, out_dir):
     plt.close()
     print(f"  Saved: {os.path.join(out_dir, 'hrf_shape_region0.png')}")
 
-# Plots the relative power spectrum of empirical, legacy, and rsHRF BOLD.
-# Averages the spectrum across all regions and saves the figure.
 def plot_bold_spectrum(sub_str, emp_bold, bold_leg, bold_hrf, TR, out_dir):
-    # Computes the Welch power spectrum for each region and averages them.
-    # Normalizes the result to relative power that sums to 1.
     def _avg_relative_psd(X):
         X = np.asarray(X, dtype=float)
         nperseg = min(X.shape[1], 64)
@@ -816,7 +766,7 @@ def plot_bold_spectrum(sub_str, emp_bold, bold_leg, bold_hrf, TR, out_dir):
     fig, ax = plt.subplots(figsize=(10, 6))
 
     if emp_bold is not None:
-        emp_X = np.asarray(emp_bold).T   # (T, N) -> (N, T)
+        emp_X = np.asarray(emp_bold).T
         f_emp, p_emp = _avg_relative_psd(emp_X)
         ax.plot(f_emp, p_emp, color='black', label='Empirical BOLD')
 
@@ -838,8 +788,6 @@ def plot_bold_spectrum(sub_str, emp_bold, bold_leg, bold_hrf, TR, out_dir):
     plt.close()
     print(f"  Saved: {os.path.join(out_dir, 'bold_spectrum_global.png')}")
 
-# Runs the signal-analysis mode: HRF shape plot and BOLD power spectrum.
-# Resolves G automatically from a completed fc sweep if not given.
 def run_signal_analysis(dataset, sub_str, G=None):
     print("\n" + "=" * 60)
     print(f"SIGNAL  DATASET: {dataset}  SUBJECT: {sub_str}")
@@ -893,13 +841,9 @@ def run_signal_analysis(dataset, sub_str, G=None):
     print(f"  Signal analysis plots saved to: {out_dir}")
 
 
-# Builds the path to a dataset's summary output folder.
-# Joins RESULTS_ROOT with the dataset name and "summary".
 def summary_dir(dataset):
     return os.path.normpath(os.path.join(RESULTS_ROOT, dataset, "summary"))
 
-# Aggregates each subject's best-fit PCorr results across a dataset.
-# Saves a paired scatter plot and a per-subject line comparison plot.
 def summarize_subjects(dataset, subjects=None):
     if subjects is None:
         subjects = ALL_SUBJECTS
@@ -957,8 +901,6 @@ def summarize_subjects(dataset, subjects=None):
     out_dir = summary_dir(dataset)
     os.makedirs(out_dir, exist_ok=True)
 
-    # Plot 1: paired scatter of rsHRF vs Legacy best-fit r, split into
-    # Controls/Patients panels with an "Equal performance" diagonal.
     n_con = int(np.sum(is_con))
     n_pat = int(np.sum(~is_con))
     n_hrf_wins_con = int(np.sum(r_hrf_v[is_con]  > r_leg_v[is_con]))
@@ -990,7 +932,6 @@ def summarize_subjects(dataset, subjects=None):
     plt.close()
     print(f"  Saved: {os.path.join(out_dir, 'best_fit_paired_scatter.png')}")
 
-    # Plot 2: Legacy vs rsHRF best-fit PCorr as two lines across subjects.
     x = np.arange(len(subs_v))
     fig2, ax2 = plt.subplots(figsize=(max(10, len(subs_v)*0.5), 6))
 
@@ -1010,7 +951,9 @@ def summarize_subjects(dataset, subjects=None):
     print(f"  {len(subs_v)}/{len(subjects)} subject(s) included. Summary plots saved to: {out_dir}")
 
 # Runs the full G sweep (legacy + rsHRF) and computes FC correlations.
-# Selects each method's best-fit G and saves the results, plots, and files.
+# Selects each method's best-fit G and saves the results, plots, and
+# files -- including Ji_legacy.txt / Ji_rshrf.txt, the full per-region
+# J_i array (N values, one per region) at each method's own best-fit G.
 def run_fc_sweep(dataset, sub_str, G_values=None):
     print("\n" + "=" * 60)
     print(f"DATASET: {dataset}  SUBJECT: {sub_str}")
@@ -1060,14 +1003,14 @@ def run_fc_sweep(dataset, sub_str, G_values=None):
     with ProcessPoolExecutor(max_workers=n_workers) as executor:
         futures = {executor.submit(run_one_G, a): a[0] for a in task_args}
         for future in as_completed(futures):
-            G, r_leg, fc_leg, strength_leg, r_hrf, fc_hrf, strength_hrf = future.result()
-            results[G] = (r_leg, fc_leg, strength_leg, r_hrf, fc_hrf, strength_hrf)
+            G, r_leg, fc_leg, strength_leg, ji_leg_arr, r_hrf, fc_hrf, strength_hrf, ji_hrf_arr = future.result()
+            results[G] = (r_leg, fc_leg, strength_leg, ji_leg_arr, r_hrf, fc_hrf, strength_hrf, ji_hrf_arr)
 
     PCorr_legacy=[]; PCorr_rshrf=[]
     FCStrength_legacy=[]; FCStrength_rshrf=[]
 
     for G in G_values:
-        r_leg, fc_leg, strength_leg, r_hrf, fc_hrf, strength_hrf = results[G]
+        r_leg, fc_leg, strength_leg, ji_leg_arr, r_hrf, fc_hrf, strength_hrf, ji_hrf_arr = results[G]
         PCorr_legacy.append(r_leg); PCorr_rshrf.append(r_hrf)
         FCStrength_legacy.append(strength_leg); FCStrength_rshrf.append(strength_hrf)
 
@@ -1086,9 +1029,14 @@ def run_fc_sweep(dataset, sub_str, G_values=None):
         G_asc, r_hrf_asc, tol=G_TOL, strength_values=strength_hrf_asc)
 
     fc_leg_at_best = results[best_G_leg][1] if best_G_leg is not None else None
-    fc_hrf_at_best = results[best_G_hrf][4] if best_G_hrf is not None else None
+    fc_hrf_at_best = results[best_G_hrf][5] if best_G_hrf is not None else None
     best_fc_leg = fc_leg_at_best.copy() if fc_leg_at_best is not None else None
     best_fc_hrf = fc_hrf_at_best.copy() if fc_hrf_at_best is not None else None
+
+    # Full per-region J_i array at each method's own best-fit G -- N
+    # values (one per region), not a per-G sweep, not a mean.
+    ji_leg_at_best = results[best_G_leg][3] if best_G_leg is not None else None
+    ji_hrf_at_best = results[best_G_hrf][7] if best_G_hrf is not None else None
 
     uidx_sc = np.triu_indices(N, 1)
     sc_norm = weights / (weights.max() + 1e-12)
@@ -1106,6 +1054,10 @@ def run_fc_sweep(dataset, sub_str, G_values=None):
     np.savetxt(os.path.join(out_dir, "FCStrength_legacy.txt"), FCStrength_legacy, fmt="%.5f")
     np.savetxt(os.path.join(out_dir, "FCStrength_rshrf.txt"),  FCStrength_rshrf,  fmt="%.5f")
     np.savetxt(os.path.join(out_dir, "G_values.txt"),       G_values,     fmt="%.2f")
+    if ji_leg_at_best is not None:
+        np.savetxt(os.path.join(out_dir, "Ji_legacy.txt"), ji_leg_at_best)
+    if ji_hrf_at_best is not None:
+        np.savetxt(os.path.join(out_dir, "Ji_rshrf.txt"),  ji_hrf_at_best)
     if best_fc_leg is not None:
         np.save(os.path.join(out_dir, "best_fc_legacy.npy"), best_fc_leg)
     if best_fc_hrf is not None:
