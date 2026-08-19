@@ -841,6 +841,243 @@ def run_signal_analysis(dataset, sub_str, G=None):
     print(f"  Signal analysis plots saved to: {out_dir}")
 
 
+# Generates 3 individual pySimpleBrainPlot SVGs (Ji_legacy, Ji_rshrf,
+# |Ji_rshrf - Ji_legacy|) on the DK68 ('aparc', 68 regions) brain atlas,
+# then attempts to composite them into ONE combined 3-panel PNG via
+# cairosvg rasterization. Not fatal if compositing fails -- cairosvg
+# needs the native Cairo graphics library, a common install pain point
+# on Windows (pip alone doesn't provide it); the 3 individual SVGs are
+# still produced regardless.
+def plot_brain_ji(dataset, sub_str, out_dir):
+    try:
+        import pySimpleBrainPlot as sbp
+    except ImportError:
+        print(f"  {sub_str}: pySimpleBrainPlot not installed -- run "
+              f"'pip install pysimplebrainplot' first. Skipping brain plot.")
+        return
+
+    ji_leg_path = os.path.join(out_dir, "Ji_legacy.txt")
+    ji_hrf_path = os.path.join(out_dir, "Ji_rshrf.txt")
+    if not (os.path.exists(ji_leg_path) and os.path.exists(ji_hrf_path)):
+        print(f"  {sub_str}: Ji_legacy.txt / Ji_rshrf.txt not found -- "
+              f"run 'fc' mode first. Skipping brain plot.")
+        return
+
+    ji_leg = np.loadtxt(ji_leg_path)
+    ji_hrf = np.loadtxt(ji_hrf_path)
+    if ji_leg.shape[0] != 68 or ji_hrf.shape[0] != 68:
+        print(f"  {sub_str}: Ji arrays have {ji_leg.shape[0]}/{ji_hrf.shape[0]} "
+              f"regions, not 68 -- pySimpleBrainPlot's 'aparc' atlas requires "
+              f"exactly 68 (DK68). Skipping brain plot.")
+        return
+
+    ji_diff = np.abs(ji_hrf - ji_leg)
+
+    # Fixed 0-3.5 scale across ALL THREE panels (not data-derived), and
+    # a stark, high-contrast colormap ('jet') so adjacent values are
+    # easily visually distinguished rather than blending smoothly.
+    shared_vmin, shared_vmax = 0.0, 3.5
+    shared_cmap = 'jet'
+    tick_values = [0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5]
+
+    # IMPORTANT: pySimpleBrainPlot's vmin/vmax parameters do NOT actually
+    # control color normalization -- verified empirically (two 68-region
+    # arrays with a 10x difference in true span, given the SAME vmin/vmax,
+    # produced the exact same 56-color set covering the full colormap in
+    # both). vmin/vmax only affect clipping outliers and the displayed
+    # min/max text; the actual color computation unconditionally rescales
+    # each array to its OWN post-clip min/max. The only way to force
+    # genuinely shared coloring through the public API is to make each
+    # array's OWN min/max actually equal the desired shared bounds -- done
+    # here by clipping to [vmin, vmax] (so any true value above 3.5 is
+    # honestly capped, not silently different from what's shown) then
+    # overwriting 2 sentinel positions per array so the array's own
+    # min/max exactly equals the shared bounds. This sacrifices those 2
+    # regions' displayed COLOR on this specific image only; their true
+    # values are untouched everywhere else (Ji_legacy.txt/Ji_rshrf.txt on
+    # disk, any other diagnostic). Anchored at the last 2 array indices;
+    # if those happen to be regions you care about visually, say so and
+    # the anchor indices can move.
+    def _force_shared_scale(values, vmin, vmax):
+        v = np.clip(values.copy(), vmin, vmax)
+        v[-2] = vmin
+        v[-1] = vmax
+        return v
+
+    panels = [
+        ('legacy', _force_shared_scale(ji_leg,  shared_vmin, shared_vmax), "Legacy (BW)"),
+        ('rshrf',  _force_shared_scale(ji_hrf,  shared_vmin, shared_vmax), "rsHRF (canon2dd)"),
+        ('diff',   _force_shared_scale(ji_diff, shared_vmin, shared_vmax), "| Legacy - rsHRF |"),
+    ]
+
+    brain_dir = os.path.join(out_dir, "brain_plot")
+    os.makedirs(brain_dir, exist_ok=True)
+
+    svg_panels = []
+    cb_path = None
+    for name, values, title in panels:
+        # plotBrain mutates its `values` argument in place (clips to
+        # vmin/vmax) -- pass a copy, never the original array.
+        sbp.plotBrain('aparc', values.copy(), vmin=shared_vmin, vmax=shared_vmax,
+                      cm=shared_cmap, save_path=brain_dir, save_file=name, viewer=False)
+        svg_path = os.path.join(brain_dir, f"{name}_aparc.svg")
+
+        # plotBrain appends a trailing <g id="g10000">...</g> block
+        # containing (a) a reference to its own colorbar image, which
+        # cairosvg doesn't reliably rasterize anyway (confirmed
+        # empirically -- text renders, the embedded raster image does
+        # not, even with an absolute path substituted in), and (b) the
+        # per-panel min/max text, which isn't wanted here since one
+        # shared colorbar covers all 3 panels. Both are stripped by
+        # removing this one trailing group -- it is always the last
+        # top-level element before </svg>, confirmed by inspecting the
+        # library's own template output directly.
+        with open(svg_path) as f:
+            svg_content = f.read()
+        strip_at = svg_content.rfind('<g id="g10000"')
+        if strip_at != -1:
+            svg_content = svg_content[:strip_at] + '</svg>\n'
+            with open(svg_path, 'w') as f:
+                f.write(svg_content)
+
+        svg_panels.append((svg_path, title))
+        # All 3 panels share the identical scale + colormap now, so the
+        # colorbar plotBrain saves alongside each SVG is visually
+        # identical across all 3 -- only need to keep one.
+        if cb_path is None:
+            cb_path = os.path.join(brain_dir, f"{name}_cb.png")
+
+    print(f"  {sub_str}: intermediate SVGs generated in {brain_dir} "
+          f"(regions at index -2/-1 show the anchor colors, not their true "
+          f"value -- see comment in plot_brain_ji for why)")
+
+    try:
+        import cairosvg
+        from PIL import Image, ImageDraw, ImageFont
+
+        panel_pngs = []
+        for svg_path, title in svg_panels:
+            png_path = svg_path.replace('.svg', '_raster.png')
+            cairosvg.svg2png(url=svg_path, write_to=png_path, output_width=900)
+            panel_pngs.append((png_path, title))
+
+        # cairosvg's PNGs have an alpha channel -- naive paste() ignores
+        # alpha and blits the underlying (black) RGB directly, which is
+        # why an early version of this rendered black backgrounds
+        # instead of white. Converting to RGBA and passing the image as
+        # its own mask fixes that. Also crop to each image's actual
+        # content bbox first, since the raw render includes a lot of
+        # transparent margin that would otherwise show as pure dead
+        # space in the final composite.
+        imgs = []
+        for p, _ in panel_pngs:
+            im = Image.open(p).convert('RGBA')
+            bbox = im.getbbox()
+            if bbox is not None:
+                im = im.crop(bbox)
+            imgs.append(im)
+
+        w = max(im.width for im in imgs)
+        h = max(im.height for im in imgs)
+
+        # PIL's default font (no size given) is a tiny, fixed ~10px
+        # bitmap font. load_default() accepts a size argument on
+        # Pillow >= 9.2.0 (2022); fall back to the old tiny default on
+        # anything older, rather than crashing. Labels stay small/plain
+        # (per request); the overall title is a bit larger.
+        try:
+            label_font = ImageFont.load_default(size=22)
+            title_font = ImageFont.load_default(size=30)
+            tick_font  = ImageFont.load_default(size=20)
+        except TypeError:
+            label_font = title_font = tick_font = ImageFont.load_default()
+
+        # The colorbar gradient IS embedded via <image xlink:href=...>
+        # inside each SVG, but cairosvg does not reliably rasterize
+        # that reference. Simpler and more robust: paste plotBrain's
+        # own standalone _cb.png directly via PIL, bypassing cairosvg
+        # for this piece entirely. Top of the strip = shared_vmax,
+        # bottom = shared_vmin (matches plotBrain's own convention,
+        # confirmed from its generated min/max text positions).
+        cb_im = Image.open(cb_path).convert('RGBA')
+        cb_im = cb_im.resize((max(1, int(cb_im.width * h / cb_im.height)), h))
+        cb_w = cb_im.width + 90  # room for tick labels beside it
+
+        box_pad = 15      # padding between a panel's content and its border box
+        panel_gap = 50   # space between adjacent brain panels
+        cb_gap = 90      # extra space between the last panel and the colorbar
+        top_title_h = 50   # overall "<subject> - Ji brainplot" title
+        label_h = 30        # per-panel label, below each brain
+
+        total_w = w * 3 + panel_gap * 2 + cb_gap + cb_w
+        combined = Image.new('RGB', (total_w, top_title_h + h + label_h + box_pad * 2), 'white')
+        draw = ImageDraw.Draw(combined)
+
+        title_text = f"{sub_str} - Ji brainplot"
+        tb = draw.textbbox((0, 0), title_text, font=title_font)
+        draw.text(((total_w - (tb[2] - tb[0])) // 2, 10), title_text, fill='black', font=title_font)
+
+        for i, (im, (_, title)) in enumerate(zip(imgs, panel_pngs)):
+            x = i * (w + panel_gap)
+            combined.paste(im, (x, top_title_h + box_pad), im)
+            # Label centered under its panel.
+            tb = draw.textbbox((0, 0), title, font=label_font)
+            tw = tb[2] - tb[0]
+            draw.text((x + w // 2 - tw // 2, top_title_h + box_pad + h + 4),
+                      title, fill='black', font=label_font)
+            # Border box around this panel's brain image + label,
+            # clearly separating the 3 panels from each other.
+            draw.rectangle(
+                [x - box_pad, top_title_h, x + w + box_pad,
+                 top_title_h + box_pad * 2 + h + label_h],
+                outline='black', width=2)
+
+        # One shared colorbar strip with explicit tick labels at each
+        # value in tick_values, positioned by linear interpolation
+        # between the strip's top (vmax) and bottom (vmin).
+        cb_x = 3 * w + 2 * panel_gap + cb_gap
+        combined.paste(cb_im, (cb_x, top_title_h + box_pad), cb_im)
+        for tv in tick_values:
+            frac_from_top = (shared_vmax - tv) / (shared_vmax - shared_vmin)
+            y = top_title_h + box_pad + int(frac_from_top * h)
+            draw.line([(cb_x + cb_im.width, y), (cb_x + cb_im.width + 8, y)], fill='black', width=2)
+            draw.text((cb_x + cb_im.width + 12, y - 10), f"{tv:g}", fill='black', font=tick_font)
+
+
+        combined_path = os.path.join(out_dir, f"brain_plot_Ji_{sub_str}.png")
+        combined.save(combined_path)
+        print(f"  {sub_str}: Saved combined 3-panel brain plot: {combined_path}")
+    except Exception as e:
+        print(f"  {sub_str}: could not composite combined 3-panel PNG ({e}). "
+              f"No fallback output was kept -- the intermediate brain_plot/ "
+              f"folder is removed regardless of success or failure. Install "
+              f"cairosvg + the native Cairo library and re-run brain-plot mode "
+              f"for this subject to get the combined image (on Windows this "
+              f"usually means installing a GTK3 runtime, or using WSL).")
+    finally:
+        # The intermediate brain_plot/ folder (3 individual SVGs, their
+        # colorbar PNGs, and the rasterized per-panel PNGs) was only
+        # ever a working area for building the combined image -- removed
+        # unconditionally, whether or not compositing succeeded, so only
+        # the final combined PNG (if produced) remains in out_dir.
+        import shutil
+        shutil.rmtree(brain_dir, ignore_errors=True)
+
+
+# Runs brain-plot mode for one subject: reads that subject's already-
+# completed Ji_legacy.txt / Ji_rshrf.txt and generates the 3-panel
+# brain visualization. Requires a completed 'fc' sweep -- does not
+# auto-run one (unlike 'signal' mode), since brain-plot's entire
+# purpose is visualizing results 'fc' mode already produced.
+def run_brain_plot(dataset, sub_str):
+    print("\n" + "=" * 60)
+    print(f"BRAIN PLOT  DATASET: {dataset}  SUBJECT: {sub_str}")
+    print("=" * 60)
+
+    out_dir = results_dir(dataset, sub_str)
+    plot_brain_ji(dataset, sub_str, out_dir)
+
+
 def summary_dir(dataset):
     return os.path.normpath(os.path.join(RESULTS_ROOT, dataset, "summary"))
 
@@ -1140,7 +1377,7 @@ if __name__ == '__main__':
                              "one G for both Legacy and rsHRF instead of each method's "
                              "own best-fit G (omit to use best-fit G's from a completed "
                              "'fc' sweep).")
-    parser.add_argument('--mode', type=str, nargs='+', choices=['bold', 'fc', 'signal', 'summary'],
+    parser.add_argument('--mode', type=str, nargs='+', choices=['bold', 'fc', 'signal', 'summary', 'brain-plot'],
                         default=['fc', 'bold', 'signal'],
                         help="Which stage(s) to run, space-separated. "
                              "'fc': FC sweep + fc_comparison.png (hand-rolled DMF+BW/rsHRF). "
@@ -1161,9 +1398,20 @@ if __name__ == '__main__':
                              "'fc' run entirely), or --subject to target one subject. "
                              "'summary': aggregate PCorr files across subjects into "
                              "summary plots under results/<dataset>/summary/ (no "
-                             "summary.json). Default (no --mode given): 'fc', then "
-                             "'bold', then 'signal', in that order. 'summary' does not "
-                             "run unless explicitly selected.")
+                             "summary.json). "
+                             "'brain-plot': per-subject DK68 brain visualization of "
+                             "Ji_legacy.txt / Ji_rshrf.txt (from a completed 'fc' sweep -- "
+                             "does NOT auto-run 'fc' if missing, unlike 'signal'), via "
+                             "pySimpleBrainPlot -- 3 panels (Legacy, rsHRF, |rsHRF-Legacy|), "
+                             "each saved as an individual SVG under "
+                             "outputs/G_sweep/brain_plot/, plus one combined 3-panel PNG "
+                             "if cairosvg + its native Cairo dependency are available "
+                             "(not fatal if not -- the 3 SVGs are produced either way). "
+                             "Requires 'pip install pysimplebrainplot' (and optionally "
+                             "cairosvg) -- not installed by requirements.txt by default. "
+                             "Default (no --mode given): 'fc', then 'bold', then 'signal', "
+                             "in that order. 'summary' and 'brain-plot' do not run unless "
+                             "explicitly selected.")
     args = parser.parse_args()
 
     subjects = [args.subject] if args.subject else ALL_SUBJECTS
@@ -1172,7 +1420,7 @@ if __name__ == '__main__':
     if 'summary' in args.mode:
         summarize_subjects(args.dataset, subjects=[args.subject] if args.subject else None)
 
-    sim_modes = [m for m in args.mode if m in ('fc', 'bold', 'signal')]
+    sim_modes = [m for m in args.mode if m in ('fc', 'bold', 'signal', 'brain-plot')]
     if sim_modes:
         print(f"Running mode(s)={sim_modes}  dataset={args.dataset}  "
               f"{len(subjects)} subject(s)"
@@ -1185,6 +1433,8 @@ if __name__ == '__main__':
                     run_bold_sweep(args.dataset, sub, G_values=G_values)
                 if 'signal' in sim_modes:
                     run_signal_analysis(args.dataset, sub, G=args.G)
+                if 'brain-plot' in sim_modes:
+                    run_brain_plot(args.dataset, sub)
             except Exception as e:
                 print(f"SUBJECT {sub} FAILED: {e}")
                 continue
