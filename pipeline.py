@@ -246,11 +246,8 @@ def prepare_sc(weights, tract_lengths, G, global_v=12_500.0):
     delays = np.clip(delays, 1, int(raw_delays.max()) + 1)
     return cap, delays
 
-# Runs the DMF neural mass model simulation and generates BOLD output.
-# Supports 'legacy' (Balloon-Windkessel) and 'rshrf' (FIC + rsHRF) modes.
-# Returns (BOLD_out, J_i) -- J_i is the full per-region array (not a
-# mean), FIC now runs for both modes so both converge to a genuine,
-# non-trivial per-region J_i, not just rsHRF.
+# Runs the DMF neural mass model, 'legacy' (BW) or 'rshrf' (FIC+rsHRF).
+# Returns (BOLD_out, J_i) -- full per-region array, FIC runs both modes.
 def run_simulation(G, weights, tract_lengths, hrf_compact,
                    total_dur_ms, BOLD_TR_ms, N,
                    J_NMDA=0.150, w_plus=1.400, tmpJi=1.000,
@@ -404,9 +401,8 @@ def run_simulation(G, weights, tract_lengths, hrf_compact,
                         + np.float32(k2) * (np.float32(1.0) - bq / bnu)
                         + np.float32(k3) * (np.float32(1.0) - bnu)))
 
-        # FIC now runs for BOTH modes -- Legacy dynamically tunes J_i
-        # exactly the same way rsHRF does (previously gated to
-        # mode=='rshrf' only).
+        # FIC now runs for BOTH modes, not just rshrf as before --
+        # Legacy dynamically tunes J_i the same way rsHRF does.
         if (ts >= FIC_start_step and ts <= FIC_end_step
                 and ts % FIC_interval_step == 0 and i_meanfr > 0):
             mean_FR_E = meanFR     / i_meanfr
@@ -454,9 +450,8 @@ def fc_strength(sim_fc, N):
     uidx = np.triu_indices(N, 1)
     return float(np.mean(sim_fc[uidx]))
 
-# Worker that runs both legacy and rsHRF simulations for one G value.
-# Returns the correlation, FC strength, AND full per-region J_i array
-# for both methods.
+# Worker: runs legacy + rsHRF for one G, returns r, strength, and the
+# full per-region J_i array for both methods.
 def run_one_G(args):
     (G, weights, tract_lengths, hrf_compact,
      total_dur_ms, BOLD_TR_ms, N, emp_fc, TR) = args
@@ -830,6 +825,195 @@ def run_signal_analysis(dataset, sub_str, G=None):
     plot_bold_spectrum(sub_str, emp_bold, bold_leg_at_chosen, bold_hrf_at_chosen, TR, out_dir)
     print(f"  Signal analysis plots saved to: {out_dir}")
 
+# Plots Ji_legacy, Ji_rshrf, and their diff on the DK68 brain atlas.
+# Compositing to one PNG needs cairosvg/Cairo; not fatal if missing.
+def plot_brain_ji(dataset, sub_str, out_dir):
+    try:
+        import pySimpleBrainPlot as sbp
+    except ImportError:
+        print(f"  {sub_str}: pySimpleBrainPlot not installed -- run "
+              f"'pip install pysimplebrainplot' first. Skipping brain plot.")
+        return
+
+    ji_leg_path = os.path.join(out_dir, "Ji_legacy.txt")
+    ji_hrf_path = os.path.join(out_dir, "Ji_rshrf.txt")
+    if not (os.path.exists(ji_leg_path) and os.path.exists(ji_hrf_path)):
+        print(f"  {sub_str}: Ji_legacy.txt / Ji_rshrf.txt not found -- "
+              f"run 'fc' mode first. Skipping brain plot.")
+        return
+
+    ji_leg = np.loadtxt(ji_leg_path)
+    ji_hrf = np.loadtxt(ji_hrf_path)
+    if ji_leg.shape[0] != 68 or ji_hrf.shape[0] != 68:
+        print(f"  {sub_str}: Ji arrays have {ji_leg.shape[0]}/{ji_hrf.shape[0]} "
+              f"regions, not 68 -- pySimpleBrainPlot's 'aparc' atlas requires "
+              f"exactly 68 (DK68). Skipping brain plot.")
+        return
+
+    ji_diff = np.abs(ji_hrf - ji_leg)
+
+    # Fixed 0-3.5 scale, all 3 panels (not data-derived), stark 'jet'
+    # colormap so adjacent values are easily distinguished.
+    shared_vmin, shared_vmax = 0.0, 3.5
+    shared_cmap = 'jet'
+    tick_values = [0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5]
+
+    # Forces each array's own min/max to the shared scale via 2 sentinel
+    # positions -- their color (not saved value) is sacrificed.
+    def _force_shared_scale(values, vmin, vmax):
+        v = np.clip(values.copy(), vmin, vmax)
+        v[-2] = vmin
+        v[-1] = vmax
+        return v
+
+    panels = [
+        ('legacy', _force_shared_scale(ji_leg,  shared_vmin, shared_vmax), "Legacy (BW)"),
+        ('rshrf',  _force_shared_scale(ji_hrf,  shared_vmin, shared_vmax), "rsHRF (canon2dd)"),
+        ('diff',   _force_shared_scale(ji_diff, shared_vmin, shared_vmax), "| Legacy - rsHRF |"),
+    ]
+
+    brain_dir = os.path.join(out_dir, "brain_plot")
+    os.makedirs(brain_dir, exist_ok=True)
+
+    svg_panels = []
+    cb_path = None
+    for name, values, title in panels:
+        # plotBrain mutates its `values` argument in place (clips to
+        # vmin/vmax) -- pass a copy, never the original array.
+        sbp.plotBrain('aparc', values.copy(), vmin=shared_vmin, vmax=shared_vmax,
+                      cm=shared_cmap, save_path=brain_dir, save_file=name, viewer=False)
+        svg_path = os.path.join(brain_dir, f"{name}_aparc.svg")
+
+        # Strips plotBrain's trailing colorbar+min/max-text group --
+        # cairosvg can't render it anyway, and we use one shared colorbar.
+        with open(svg_path) as f:
+            svg_content = f.read()
+        strip_at = svg_content.rfind('<g id="g10000"')
+        if strip_at != -1:
+            svg_content = svg_content[:strip_at] + '</svg>\n'
+            with open(svg_path, 'w') as f:
+                f.write(svg_content)
+
+        svg_panels.append((svg_path, title))
+        # All 3 panels share the identical scale + colormap now, so the
+        # colorbar plotBrain saves alongside each SVG is visually
+        # identical across all 3 -- only need to keep one.
+        if cb_path is None:
+            cb_path = os.path.join(brain_dir, f"{name}_cb.png")
+
+    print(f"  {sub_str}: intermediate SVGs generated in {brain_dir} "
+          f"(regions at index -2/-1 show the anchor colors, not their true "
+          f"value -- see comment in plot_brain_ji for why)")
+
+    try:
+        import cairosvg
+        from PIL import Image, ImageDraw, ImageFont
+
+        panel_pngs = []
+        for svg_path, title in svg_panels:
+            png_path = svg_path.replace('.svg', '_raster.png')
+            cairosvg.svg2png(url=svg_path, write_to=png_path, output_width=900)
+            panel_pngs.append((png_path, title))
+
+        # RGBA + paste-as-own-mask avoids a black-background bug from
+        # naive paste(); crop to bbox to drop transparent dead space.
+        imgs = []
+        for p, _ in panel_pngs:
+            im = Image.open(p).convert('RGBA')
+            bbox = im.getbbox()
+            if bbox is not None:
+                im = im.crop(bbox)
+            imgs.append(im)
+
+        w = max(im.width for im in imgs)
+        h = max(im.height for im in imgs)
+
+        # PIL's sizeless default font is a tiny ~10px bitmap; size= needs
+        # Pillow >= 9.2.0, fall back to the old default if older.
+        try:
+            label_font = ImageFont.load_default(size=22)
+            title_font = ImageFont.load_default(size=30)
+            tick_font  = ImageFont.load_default(size=20)
+        except TypeError:
+            label_font = title_font = tick_font = ImageFont.load_default()
+
+        # cairosvg can't rasterize the embedded colorbar reliably, so
+        # paste plotBrain's own _cb.png directly instead (top=vmax).
+        cb_im = Image.open(cb_path).convert('RGBA')
+        cb_im = cb_im.resize((max(1, int(cb_im.width * h / cb_im.height)), h))
+        cb_w = cb_im.width + 90  # room for tick labels beside it
+
+        box_pad = 15      # padding between a panel's content and its border box
+        panel_gap = 50   # space between adjacent brain panels
+        cb_gap = 90      # extra space between the last panel and the colorbar
+        top_title_h = 50   # overall "<subject> - Ji brainplot" title
+        label_h = 30        # per-panel label, below each brain
+
+        total_w = w * 3 + panel_gap * 2 + cb_gap + cb_w
+        combined = Image.new('RGB', (total_w, top_title_h + h + label_h + box_pad * 2), 'white')
+        draw = ImageDraw.Draw(combined)
+
+        title_text = f"{sub_str} - Ji brainplot"
+        tb = draw.textbbox((0, 0), title_text, font=title_font)
+        draw.text(((total_w - (tb[2] - tb[0])) // 2, 10), title_text, fill='black', font=title_font)
+
+        for i, (im, (_, title)) in enumerate(zip(imgs, panel_pngs)):
+            x = i * (w + panel_gap)
+            combined.paste(im, (x, top_title_h + box_pad), im)
+            # Label centered under its panel.
+            tb = draw.textbbox((0, 0), title, font=label_font)
+            tw = tb[2] - tb[0]
+            draw.text((x + w // 2 - tw // 2, top_title_h + box_pad + h + 4),
+                      title, fill='black', font=label_font)
+            # Border box around this panel's brain image + label,
+            # clearly separating the 3 panels from each other.
+            draw.rectangle(
+                [x - box_pad, top_title_h, x + w + box_pad,
+                 top_title_h + box_pad * 2 + h + label_h],
+                outline='black', width=2)
+
+        # One shared colorbar strip with explicit tick labels at each
+        # value in tick_values, positioned by linear interpolation
+        # between the strip's top (vmax) and bottom (vmin).
+        cb_x = 3 * w + 2 * panel_gap + cb_gap
+        combined.paste(cb_im, (cb_x, top_title_h + box_pad), cb_im)
+        for tv in tick_values:
+            frac_from_top = (shared_vmax - tv) / (shared_vmax - shared_vmin)
+            y = top_title_h + box_pad + int(frac_from_top * h)
+            draw.line([(cb_x + cb_im.width, y), (cb_x + cb_im.width + 8, y)], fill='black', width=2)
+            draw.text((cb_x + cb_im.width + 12, y - 10), f"{tv:g}", fill='black', font=tick_font)
+
+
+        combined_path = os.path.join(out_dir, f"brain_plot_Ji_{sub_str}.png")
+        combined.save(combined_path)
+        print(f"  {sub_str}: Saved combined 3-panel brain plot: {combined_path}")
+    except Exception as e:
+        print(f"  {sub_str}: could not composite combined 3-panel PNG ({e}). "
+              f"No fallback output was kept -- the intermediate brain_plot/ "
+              f"folder is removed regardless of success or failure. Install "
+              f"cairosvg + the native Cairo library and re-run brain-plot mode "
+              f"for this subject to get the combined image (on Windows this "
+              f"usually means installing a GTK3 runtime, or using WSL).")
+    finally:
+        # The intermediate brain_plot/ folder (3 individual SVGs, their
+        # colorbar PNGs, and the rasterized per-panel PNGs) was only
+        # ever a working area for building the combined image -- removed
+        # unconditionally, whether or not compositing succeeded, so only
+        # the final combined PNG (if produced) remains in out_dir.
+        import shutil
+        shutil.rmtree(brain_dir, ignore_errors=True)
+
+
+# Runs brain-plot for one subject. Requires a completed 'fc' sweep --
+# unlike 'signal' mode, does not auto-run one if missing.
+def run_brain_plot(dataset, sub_str):
+    print("\n" + "=" * 60)
+    print(f"BRAIN PLOT  DATASET: {dataset}  SUBJECT: {sub_str}")
+    print("=" * 60)
+
+    out_dir = results_dir(dataset, sub_str)
+    plot_brain_ji(dataset, sub_str, out_dir)
+
 
 def summary_dir(dataset):
     return os.path.normpath(os.path.join(RESULTS_ROOT, dataset, "summary"))
@@ -839,7 +1023,7 @@ def summarize_subjects(dataset, subjects=None):
         subjects = ALL_SUBJECTS
 
     G_TOL = 0.015
-    subs, best_r_leg, best_r_hrf = [], [], []
+    subs, best_r_leg, best_r_hrf, best_G_leg, best_G_hrf = [], [], [], [], []
 
     for sub in subjects:
         out_dir  = results_dir(dataset, sub)
@@ -865,12 +1049,14 @@ def summarize_subjects(dataset, subjects=None):
             strength_leg_asc = list(np.loadtxt(strength_leg_path)[asc_order])
             strength_hrf_asc = list(np.loadtxt(strength_hrf_path)[asc_order])
 
-        _, best_rl, _ = select_best_G(G_asc, r_leg_asc, tol=G_TOL, strength_values=strength_leg_asc)
-        _, best_rh, _ = select_best_G(G_asc, r_hrf_asc, tol=G_TOL, strength_values=strength_hrf_asc)
+        best_gl, best_rl, _ = select_best_G(G_asc, r_leg_asc, tol=G_TOL, strength_values=strength_leg_asc)
+        best_gh, best_rh, _ = select_best_G(G_asc, r_hrf_asc, tol=G_TOL, strength_values=strength_hrf_asc)
 
         subs.append(sub)
         best_r_leg.append(best_rl)
         best_r_hrf.append(best_rh)
+        best_G_leg.append(best_gl)
+        best_G_hrf.append(best_gh)
 
     if not subs:
         print(f"  No subjects with completed PCorr files found for dataset={dataset}")
@@ -878,10 +1064,14 @@ def summarize_subjects(dataset, subjects=None):
 
     r_leg_arr = np.array(best_r_leg, dtype=float)
     r_hrf_arr = np.array(best_r_hrf, dtype=float)
+    G_leg_arr = np.array([np.nan if g is None else g for g in best_G_leg], dtype=float)
+    G_hrf_arr = np.array([np.nan if g is None else g for g in best_G_hrf], dtype=float)
     valid   = ~(np.isnan(r_leg_arr) | np.isnan(r_hrf_arr))
     subs_v  = [s for s, v in zip(subs, valid) if v]
     r_leg_v = r_leg_arr[valid]
     r_hrf_v = r_hrf_arr[valid]
+    G_leg_v = G_leg_arr[valid]
+    G_hrf_v = G_hrf_arr[valid]
     is_con  = np.array([s.upper().startswith('CON') for s in subs_v])
 
     if len(subs_v) == 0:
@@ -923,27 +1113,43 @@ def summarize_subjects(dataset, subjects=None):
     print(f"  Saved: {os.path.join(out_dir, 'best_fit_paired_scatter.png')}")
 
     x = np.arange(len(subs_v))
+    bar_w = 0.38
     fig2, ax2 = plt.subplots(figsize=(max(10, len(subs_v)*0.5), 6))
 
-    ax2.plot(x, r_leg_v, 'b-o', label='Legacy', markersize=6)
-    ax2.plot(x, r_hrf_v, 'r-o', label='rsHRF',  markersize=6)
+    ax2.bar(x - bar_w/2, r_leg_v, bar_w, label='Legacy', color='tab:blue')
+    ax2.bar(x + bar_w/2, r_hrf_v, bar_w, label='rsHRF',  color='tab:red')
 
     ax2.set_xticks(x); ax2.set_xticklabels(subs_v, rotation=45, ha='right')
     ax2.set_ylabel("Best-fit Pearson r (PCorr)")
     ax2.set_title(f"PCorr at best fit - Legacy vs rsHRF - {dataset}")
     ax2.legend()
-    ax2.grid(True, alpha=0.3)
+    ax2.grid(True, alpha=0.3, axis='y')
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "best_fit_parameter_differences.png"), dpi=150)
     plt.close()
     print(f"  Saved: {os.path.join(out_dir, 'best_fit_parameter_differences.png')}")
 
+    # Plot 3: same paired-bar layout as Plot 2, but best-fit G instead
+    # of PCorr -- Legacy vs rsHRF, per subject.
+    fig3, ax3 = plt.subplots(figsize=(max(10, len(subs_v)*0.5), 6))
+
+    ax3.bar(x - bar_w/2, G_leg_v, bar_w, label='Legacy', color='tab:blue')
+    ax3.bar(x + bar_w/2, G_hrf_v, bar_w, label='rsHRF',  color='tab:red')
+
+    ax3.set_xticks(x); ax3.set_xticklabels(subs_v, rotation=45, ha='right')
+    ax3.set_ylabel("Best-fit global coupling (G)")
+    ax3.set_title(f"G at best fit - Legacy vs rsHRF - {dataset}")
+    ax3.legend()
+    ax3.grid(True, alpha=0.3, axis='y')
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "best_fit_G_differences.png"), dpi=150)
+    plt.close()
+    print(f"  Saved: {os.path.join(out_dir, 'best_fit_G_differences.png')}")
+
     print(f"  {len(subs_v)}/{len(subjects)} subject(s) included. Summary plots saved to: {out_dir}")
 
-# Runs the full G sweep (legacy + rsHRF) and computes FC correlations.
-# Selects each method's best-fit G and saves the results, plots, and
-# files -- including Ji_legacy.txt / Ji_rshrf.txt, the full per-region
-# J_i array (N values, one per region) at each method's own best-fit G.
+# Runs the full G sweep, selects each method's best-fit G, and saves
+# results/plots -- including Ji_legacy.txt / Ji_rshrf.txt at that G.
 def run_fc_sweep(dataset, sub_str, G_values=None):
     print("\n" + "=" * 60)
     print(f"DATASET: {dataset}  SUBJECT: {sub_str}")
@@ -1106,7 +1312,7 @@ if __name__ == '__main__':
                              "one G for both Legacy and rsHRF instead of each method's "
                              "own best-fit G (omit to use best-fit G's from a completed "
                              "'fc' sweep).")
-    parser.add_argument('--mode', type=str, nargs='+', choices=['bold', 'fc', 'signal', 'summary'],
+    parser.add_argument('--mode', type=str, nargs='+', choices=['bold', 'fc', 'signal', 'summary', 'brain-plot'],
                         default=['fc', 'bold', 'signal'],
                         help="Which stage(s) to run, space-separated. "
                              "'fc': FC sweep + fc_comparison.png (hand-rolled DMF+BW/rsHRF). "
@@ -1127,9 +1333,20 @@ if __name__ == '__main__':
                              "'fc' run entirely), or --subject to target one subject. "
                              "'summary': aggregate PCorr files across subjects into "
                              "summary plots under results/<dataset>/summary/ (no "
-                             "summary.json). Default (no --mode given): 'fc', then "
-                             "'bold', then 'signal', in that order. 'summary' does not "
-                             "run unless explicitly selected.")
+                             "summary.json). "
+                             "'brain-plot': per-subject DK68 brain visualization of "
+                             "Ji_legacy.txt / Ji_rshrf.txt (from a completed 'fc' sweep -- "
+                             "does NOT auto-run 'fc' if missing, unlike 'signal'), via "
+                             "pySimpleBrainPlot -- 3 panels (Legacy, rsHRF, |rsHRF-Legacy|), "
+                             "each saved as an individual SVG under "
+                             "outputs/G_sweep/brain_plot/, plus one combined 3-panel PNG "
+                             "if cairosvg + its native Cairo dependency are available "
+                             "(not fatal if not -- the 3 SVGs are produced either way). "
+                             "Requires 'pip install pysimplebrainplot' (and optionally "
+                             "cairosvg) -- not installed by requirements.txt by default. "
+                             "Default (no --mode given): 'fc', then 'bold', then 'signal', "
+                             "in that order. 'summary' and 'brain-plot' do not run unless "
+                             "explicitly selected.")
     args = parser.parse_args()
 
     subjects = [args.subject] if args.subject else ALL_SUBJECTS
@@ -1138,7 +1355,7 @@ if __name__ == '__main__':
     if 'summary' in args.mode:
         summarize_subjects(args.dataset, subjects=[args.subject] if args.subject else None)
 
-    sim_modes = [m for m in args.mode if m in ('fc', 'bold', 'signal')]
+    sim_modes = [m for m in args.mode if m in ('fc', 'bold', 'signal', 'brain-plot')]
     if sim_modes:
         print(f"Running mode(s)={sim_modes}  dataset={args.dataset}  "
               f"{len(subjects)} subject(s)"
@@ -1151,6 +1368,8 @@ if __name__ == '__main__':
                     run_bold_sweep(args.dataset, sub, G_values=G_values)
                 if 'signal' in sim_modes:
                     run_signal_analysis(args.dataset, sub, G=args.G)
+                if 'brain-plot' in sim_modes:
+                    run_brain_plot(args.dataset, sub)
             except Exception as e:
                 print(f"SUBJECT {sub} FAILED: {e}")
                 continue
