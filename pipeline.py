@@ -1035,7 +1035,7 @@ def summarize_subjects(dataset, subjects=None):
         subjects = ALL_SUBJECTS
 
     G_TOL = 0.015
-    subs, best_r_leg, best_r_hrf = [], [], []
+    subs, best_r_leg, best_r_hrf, best_G_leg, best_G_hrf = [], [], [], [], []
 
     for sub in subjects:
         out_dir  = results_dir(dataset, sub)
@@ -1061,12 +1061,14 @@ def summarize_subjects(dataset, subjects=None):
             strength_leg_asc = list(np.loadtxt(strength_leg_path)[asc_order])
             strength_hrf_asc = list(np.loadtxt(strength_hrf_path)[asc_order])
 
-        _, best_rl, _ = select_best_G(G_asc, r_leg_asc, tol=G_TOL, strength_values=strength_leg_asc)
-        _, best_rh, _ = select_best_G(G_asc, r_hrf_asc, tol=G_TOL, strength_values=strength_hrf_asc)
+        best_gl, best_rl, _ = select_best_G(G_asc, r_leg_asc, tol=G_TOL, strength_values=strength_leg_asc)
+        best_gh, best_rh, _ = select_best_G(G_asc, r_hrf_asc, tol=G_TOL, strength_values=strength_hrf_asc)
 
         subs.append(sub)
         best_r_leg.append(best_rl)
         best_r_hrf.append(best_rh)
+        best_G_leg.append(best_gl)
+        best_G_hrf.append(best_gh)
 
     if not subs:
         print(f"  No subjects with completed PCorr files found for dataset={dataset}")
@@ -1074,10 +1076,14 @@ def summarize_subjects(dataset, subjects=None):
 
     r_leg_arr = np.array(best_r_leg, dtype=float)
     r_hrf_arr = np.array(best_r_hrf, dtype=float)
+    G_leg_arr = np.array([np.nan if g is None else g for g in best_G_leg], dtype=float)
+    G_hrf_arr = np.array([np.nan if g is None else g for g in best_G_hrf], dtype=float)
     valid   = ~(np.isnan(r_leg_arr) | np.isnan(r_hrf_arr))
     subs_v  = [s for s, v in zip(subs, valid) if v]
     r_leg_v = r_leg_arr[valid]
     r_hrf_v = r_hrf_arr[valid]
+    G_leg_v = G_leg_arr[valid]
+    G_hrf_v = G_hrf_arr[valid]
     is_con  = np.array([s.upper().startswith('CON') for s in subs_v])
 
     if len(subs_v) == 0:
@@ -1119,22 +1125,40 @@ def summarize_subjects(dataset, subjects=None):
     plt.close()
     print(f"  Saved: {os.path.join(out_dir, 'best_fit_paired_scatter.png')}")
 
-    # Plot 2: PCorr differences, one line per method across subjects
+    # Plot 2: PCorr, paired bar chart per subject
     x = np.arange(len(subs_v))
+    bar_w = 0.38
     fig2, ax2 = plt.subplots(figsize=(max(10, len(subs_v)*0.5), 6))
 
-    ax2.plot(x, r_leg_v, 'b-o', label='Legacy', markersize=6)
-    ax2.plot(x, r_hrf_v, 'r-o', label='rsHRF',  markersize=6)
+    ax2.bar(x - bar_w/2, r_leg_v, bar_w, label='Legacy', color='tab:blue')
+    ax2.bar(x + bar_w/2, r_hrf_v, bar_w, label='rsHRF',  color='tab:red')
 
     ax2.set_xticks(x); ax2.set_xticklabels(subs_v, rotation=45, ha='right')
     ax2.set_ylabel("Best-fit Pearson r (PCorr)")
     ax2.set_title(f"PCorr at best fit - Legacy vs rsHRF - {dataset}")
     ax2.legend()
-    ax2.grid(True, alpha=0.3)
+    ax2.grid(True, alpha=0.3, axis='y')
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "best_fit_parameter_differences.png"), dpi=150)
     plt.close()
     print(f"  Saved: {os.path.join(out_dir, 'best_fit_parameter_differences.png')}")
+
+    # Plot 3: same paired-bar layout as Plot 2, but best-fit G instead
+    # of PCorr -- Legacy vs rsHRF, per subject.
+    fig3, ax3 = plt.subplots(figsize=(max(10, len(subs_v)*0.5), 6))
+
+    ax3.bar(x - bar_w/2, G_leg_v, bar_w, label='Legacy', color='tab:blue')
+    ax3.bar(x + bar_w/2, G_hrf_v, bar_w, label='rsHRF',  color='tab:red')
+
+    ax3.set_xticks(x); ax3.set_xticklabels(subs_v, rotation=45, ha='right')
+    ax3.set_ylabel("Best-fit global coupling (G)")
+    ax3.set_title(f"G at best fit - Legacy vs rsHRF - {dataset}")
+    ax3.legend()
+    ax3.grid(True, alpha=0.3, axis='y')
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "best_fit_G_differences.png"), dpi=150)
+    plt.close()
+    print(f"  Saved: {os.path.join(out_dir, 'best_fit_G_differences.png')}")
 
     print(f"  {len(subs_v)}/{len(subjects)} subject(s) included. Summary plots saved to: {out_dir}")
 
