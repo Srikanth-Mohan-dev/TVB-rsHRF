@@ -1,4 +1,9 @@
-﻿# rsHRF-TVB Pipeline
+﻿# Integrating personalized hemodynamic response function in The Virtual Brain & EBRAINS
+
+This project took place over the summer of 2026 as part of Google Summer of Code, under Professor Daniele Marinazzo, addressing a known limitation in The Virtual Brain (TVB): TVB's standard BOLD monitor convolves simulated neural activity with a single, constant Hemodynamic Response Function (HRF) shared across every brain region and every subject. Since HRF shape is known to vary across both subjects and brain regions, using one fixed HRF for the whole brain risks attributing HRF-driven variability to neural activity instead.
+
+The goal was to replace that constant HRF with a region- and subject-specific HRF, estimated per-subject from resting-state fMRI using the [rsHRF](https://github.com/bids-apps/rsHRF) toolbox, and convolve simulated neural activity with these curves instead of the default Balloon-Windkessel model.
+
 
 ## Project Setup
 
