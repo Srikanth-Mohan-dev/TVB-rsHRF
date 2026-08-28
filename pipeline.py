@@ -850,13 +850,16 @@ def plot_brain_ji(dataset, sub_str, out_dir):
               f"exactly 68 (DK68). Skipping brain plot.")
         return
 
-    ji_diff = np.abs(ji_hrf - ji_leg)
+    ji_diff = ji_hrf - ji_leg
 
     # Fixed 0-3.5 scale, all 3 panels (not data-derived), stark 'jet'
     # colormap so adjacent values are easily distinguished.
     shared_vmin, shared_vmax = 0.0, 3.5
     shared_cmap = 'jet'
+    diff_cmap = 'bwr'  # diverging blue-white-red colormap for the diff panel
+    diff_vmin, diff_vmax = -3.5, 3.5  # symmetric so 'bwr' centers white on zero
     tick_values = [0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5]
+    diff_tick_values = [-3.5, -3.0, -2.5, -2.0, -1.5, -1.0, -0.5, 0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5]
 
     # Forces each array's own min/max to the shared scale via 2 sentinel
     # positions -- their color (not saved value) is sacrificed.
@@ -867,9 +870,9 @@ def plot_brain_ji(dataset, sub_str, out_dir):
         return v
 
     panels = [
-        ('legacy', _force_shared_scale(ji_leg,  shared_vmin, shared_vmax), "Legacy (BW)"),
-        ('rshrf',  _force_shared_scale(ji_hrf,  shared_vmin, shared_vmax), "rsHRF (canon2dd)"),
-        ('diff',   _force_shared_scale(ji_diff, shared_vmin, shared_vmax), "| Legacy - rsHRF |"),
+        ('legacy', _force_shared_scale(ji_leg,  shared_vmin, shared_vmax), "Legacy (BW)", shared_cmap, shared_vmin, shared_vmax),
+        ('rshrf',  _force_shared_scale(ji_hrf,  shared_vmin, shared_vmax), "rsHRF (canon2dd)", shared_cmap, shared_vmin, shared_vmax),
+        ('diff',   _force_shared_scale(ji_diff, diff_vmin, diff_vmax), "Legacy - rsHRF", diff_cmap, diff_vmin, diff_vmax),
     ]
 
     brain_dir = os.path.join(out_dir, "brain_plot")
@@ -877,11 +880,12 @@ def plot_brain_ji(dataset, sub_str, out_dir):
 
     svg_panels = []
     cb_path = None
-    for name, values, title in panels:
+    diff_cb_path = None
+    for name, values, title, cm, vmin, vmax in panels:
         # plotBrain mutates its `values` argument in place (clips to
         # vmin/vmax) -- pass a copy, never the original array.
-        sbp.plotBrain('aparc', values.copy(), vmin=shared_vmin, vmax=shared_vmax,
-                      cm=shared_cmap, save_path=brain_dir, save_file=name, viewer=False)
+        sbp.plotBrain('aparc', values.copy(), vmin=vmin, vmax=vmax,
+                      cm=cm, save_path=brain_dir, save_file=name, viewer=False)
         svg_path = os.path.join(brain_dir, f"{name}_aparc.svg")
 
         # Strips plotBrain's trailing colorbar+min/max-text group --
@@ -895,10 +899,13 @@ def plot_brain_ji(dataset, sub_str, out_dir):
                 f.write(svg_content)
 
         svg_panels.append((svg_path, title))
-        # All 3 panels share the identical scale + colormap now, so the
-        # colorbar plotBrain saves alongside each SVG is visually
-        # identical across all 3 -- only need to keep one.
-        if cb_path is None:
+        # Legacy/rshrf share an identical scale + colormap, so the
+        # colorbar plotBrain saves alongside each is visually identical
+        # across the two -- only need to keep one. Diff now has its own
+        # diverging scale/colormap, so its colorbar is kept separately.
+        if name == 'diff':
+            diff_cb_path = os.path.join(brain_dir, f"{name}_cb.png")
+        elif cb_path is None:
             cb_path = os.path.join(brain_dir, f"{name}_cb.png")
 
     print(f"  {sub_str}: intermediate SVGs generated in {brain_dir} "
@@ -943,13 +950,17 @@ def plot_brain_ji(dataset, sub_str, out_dir):
         cb_im = cb_im.resize((max(1, int(cb_im.width * h / cb_im.height)), h))
         cb_w = cb_im.width + 90  # room for tick labels beside it
 
+        diff_cb_im = Image.open(diff_cb_path).convert('RGBA')
+        diff_cb_im = diff_cb_im.resize((max(1, int(diff_cb_im.width * h / diff_cb_im.height)), h))
+        diff_cb_w = diff_cb_im.width + 90  # room for tick labels beside it
+
         box_pad = 15      # padding between a panel's content and its border box
         panel_gap = 50   # space between adjacent brain panels
         cb_gap = 90      # extra space between the last panel and the colorbar
         top_title_h = 50   # overall "<subject> - Ji brainplot" title
         label_h = 30        # per-panel label, below each brain
 
-        total_w = w * 3 + panel_gap * 2 + cb_gap + cb_w
+        total_w = w * 3 + panel_gap * 2 + cb_gap + cb_w + cb_gap + diff_cb_w
         combined = Image.new('RGB', (total_w, top_title_h + h + label_h + box_pad * 2), 'white')
         draw = ImageDraw.Draw(combined)
 
@@ -972,8 +983,8 @@ def plot_brain_ji(dataset, sub_str, out_dir):
                  top_title_h + box_pad * 2 + h + label_h],
                 outline='black', width=2)
 
-        # One shared colorbar strip with explicit tick labels at each
-        # value in tick_values, positioned by linear interpolation
+        # Colorbar strip for legacy/rshrf, with explicit tick labels at
+        # each value in tick_values, positioned by linear interpolation
         # between the strip's top (vmax) and bottom (vmin).
         cb_x = 3 * w + 2 * panel_gap + cb_gap
         combined.paste(cb_im, (cb_x, top_title_h + box_pad), cb_im)
@@ -982,6 +993,15 @@ def plot_brain_ji(dataset, sub_str, out_dir):
             y = top_title_h + box_pad + int(frac_from_top * h)
             draw.line([(cb_x + cb_im.width, y), (cb_x + cb_im.width + 8, y)], fill='black', width=2)
             draw.text((cb_x + cb_im.width + 12, y - 10), f"{tv:g}", fill='black', font=tick_font)
+
+        # Second colorbar strip for diff's own diverging scale.
+        diff_cb_x = cb_x + cb_w + cb_gap
+        combined.paste(diff_cb_im, (diff_cb_x, top_title_h + box_pad), diff_cb_im)
+        for tv in diff_tick_values:
+            frac_from_top = (diff_vmax - tv) / (diff_vmax - diff_vmin)
+            y = top_title_h + box_pad + int(frac_from_top * h)
+            draw.line([(diff_cb_x + diff_cb_im.width, y), (diff_cb_x + diff_cb_im.width + 8, y)], fill='black', width=2)
+            draw.text((diff_cb_x + diff_cb_im.width + 12, y - 10), f"{tv:g}", fill='black', font=tick_font)
 
 
         combined_path = os.path.join(out_dir, f"brain_plot_Ji_{sub_str}.png")
